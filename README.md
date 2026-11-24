@@ -22,16 +22,50 @@ The function returns one complete result; the plugin reshapes it into OpenAI Cha
 
 ## Models
 
-| Model ID | Context |
-| --- | --- |
-| `hy4-flash` | 1M |
-| `hy4` | 1M |
-| `hy4-preview` | 1M |
-| `hy3` | 256K |
-| `deepseek-v4.1-flash` | 1M |
-| `deepseek-v4.1-flash-1017` | 1M |
+| Model ID | Type | Context / output |
+| --- | --- | --- |
+| `hy4-flash` | text chat | 1M |
+| `hy4` | text chat | 1M |
+| `hy4-preview` | text chat | 1M |
+| `hy3` | text chat | 256K |
+| `deepseek-v4.1-flash` | text chat | 1M |
+| `deepseek-v4.1-flash-1017` | text chat | 1M |
+| `hy-image-v3.5-preview` | **image generation** | up to 4096x4096 |
 
-No console opt-in needed; usage is deducted from the gift pack automatically. Availability can vary per environment — if CloudBase answers `AI_MODEL_NOT_SUPPORTED`, go by what your environment actually supports. The image-generation model `hy-image-v3.5-preview` is out of scope for this plugin: the bridge only carries text chat.
+No console opt-in needed; usage is deducted from the gift pack automatically
+(tokens for text, the 100K image generations for images). Availability can
+vary per environment — if CloudBase answers `AI_MODEL_NOT_SUPPORTED`, go by
+what your environment actually supports.
+
+### Using the image model
+
+`hy-image-v3.5-preview` uses the Chat/Messages protocol
+(`createImageModel` + `generateImage`), a different SDK channel from text
+chat. The plugin routes it with `action: "image"`, but it stays one ordinary
+OpenAI-compatible provider:
+
+- Pick `cloudbase/hy-image-v3.5-preview` in your agent and send the prompt as
+  a normal user message;
+- The reply's `content` is a markdown image `![generated image](url)`.
+  Non-streaming responses also carry a structured `image` field (`url`,
+  `width`, `height`, `assembled_history`, `request_id`) for programmatic use;
+- For 4K, a fixed seed, a watermark or reference images, add `size`
+  (e.g. `4096x4096`), `seed`, `footnote`, `session` to the request body, or
+  mix `{ type: "image_url", image_url: { url } }` parts (public URL or
+  Base64) into `messages[].content`;
+- Multi-turn editing: keep the same `session` and replay the previous reply's
+  `image.assembled_history` into `messages` before the new user message
+  (calling the cloud function directly exposes the full fields).
+
+> ⚠️ Image URLs are temporary and **expire after 12 hours** — download them
+> or transfer them to cloud storage promptly. See the
+> [image model docs](https://docs.cloudbase.net/ai/image-model/hy-image-3.5-preview).
+
+**Deployment requirements:** image generation needs aiProxy **1.2.0+**,
+`@cloudbase/node-sdk ^3.18.3` (resolves `@cloudbase/ai >= 2.32.0`) and a
+**900 s** cloud-function timeout. When upgrading from 1.1.0 you must redeploy
+and let the platform reinstall dependencies — otherwise `ping` won't report
+`imageModels` and the plugin won't list the model.
 
 ## What you need
 
@@ -52,7 +86,7 @@ tcb fn deploy aiProxy --force
 tcb fn invoke aiProxy --params '{"action":"ping"}'   # expect {"ok":true,...}
 ```
 
-Key points: a normal Event Function (not an HTTP function), Nodejs18.15 or newer, timeout 120 s, cloud dependency install enabled. No need to configure the environment id — the runtime injects `TCB_ENV` automatically. To add or remove models, set the function's `AI_PROXY_ALLOWED_MODELS` env var (comma-separated).
+Key points: a normal Event Function (not an HTTP function), Nodejs18.15 or newer, timeout **900 s** (image generation is slow, 4K especially; 120 s is enough for text chat alone, but both channels share one function — take the larger value), cloud dependency install enabled (`@cloudbase/node-sdk ^3.18.3`). No need to configure the environment id — the runtime injects `TCB_ENV` automatically. To add or remove models, set `AI_PROXY_ALLOWED_MODELS` (text) and `AI_PROXY_ALLOWED_IMAGE_MODELS` (image), comma-separated. **After upgrading from an older function, redeploy and reinstall dependencies**, or image generation won't be available.
 
 ## Install & login
 
@@ -91,7 +125,7 @@ m plugin options cloudbase-bridge '{"gatewayBaseUrl":"http://127.0.0.1:8787"}'
 | Option | What it does | Default |
 | --- | --- | --- |
 | `envId` / `region` / `functionName` | fallbacks beyond the login answers (handy under plain OpenCode, where the login prompts may not render) | — / `cn` / `aiProxy` |
-| `timeoutMs` | how long one function invocation may take | 150000 |
+| `timeoutMs` | how long one text function invocation may take; **image requests are automatically given 900 s** | 150000 |
 | `gatewayBaseUrl` | testing-only gateway URL override | unset |
 
 ## When something goes wrong
@@ -100,17 +134,19 @@ Errors come back as OpenAI-style `{ error: { message, code } }`, and the message
 
 ## Known limitations
 
-- No true streaming: the upstream reply is one-shot, SSE is synthesized locally, so the first token only arrives when generation finishes;
+- No true streaming: the upstream reply is one-shot, SSE is synthesized locally, so the first token only arrives when generation finishes — the same applies to images (the whole image must be generated first);
 - tool calling needs aiProxy 1.1.0 or later — redeploy the function (`tcb fn deploy aiProxy --force`) after upgrading the plugin from 0.2.4 or earlier;
-- no image input;
-- very long outputs can hit the function's 120 s timeout;
+- image generation needs aiProxy 1.2.0+, `@cloudbase/node-sdk ^3.18.3` and a 900 s function timeout;
+- **text chat** has no image input (`IMAGE_INPUT_NOT_SUPPORTED`); the **image model** accepts reference images via `image_url` content parts;
+- generated image URLs expire after **12 hours** — transfer them to cloud storage. Multi-turn `assembled_history` is currently exposed only in the non-streaming `image` structured field;
+- very long outputs / 4K images can be slow; be patient;
 - no quota reporting (no official API for it); the gift quota itself expires (6 months).
 
 ## Development
 
 ```bash
 npm install
-npm run check     # typecheck + build + 34 unit tests + host-like load check — no network, no real credentials
+npm run check     # typecheck + build + 61 unit tests + host-like load check — no network, no real credentials
 ```
 
 Publishing and listing steps are in [`docs/publish-checklist.md`](docs/publish-checklist.md).

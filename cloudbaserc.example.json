@@ -5,8 +5,8 @@
   "functions": [
     {
       "name": "aiProxy",
-      "timeout": 120,
-      "memorySize": 256,
+      "timeout": 900,
+      "memorySize": 512,
       "runtime": "Nodejs18.15",
       "installDependency": true,
       "envVariables": {},

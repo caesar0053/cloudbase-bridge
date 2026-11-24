@@ -12,10 +12,22 @@
  * The growth-plan quota is only spendable from CloudBase SDK channels; direct
  * calls to the HTTP AI model endpoints (`/v1/ai/...`) are rejected with
  * `AI_CHANNEL_NOT_ALLOWED`. The cloud function therefore calls the model with
- * `@cloudbase/node-sdk` (`ai.createModel("cloudbase")` + `generateText`) and
- * returns a one-shot OpenAI-compatible JSON. This plugin adapts that JSON
- * into OpenAI Chat Completions responses and synthesizes SSE frames when the
- * agent requested `stream: true`.
+ * `@cloudbase/node-sdk`. This plugin adapts the JSON into OpenAI Chat
+ * Completions responses and synthesizes SSE frames when the agent requested
+ * `stream: true`.
+ *
+ * Two channels share the same `aiProxy` function, selected by event.action:
+ *   - "chat":  createModel("cloudbase").generateText  -> text chat models
+ *              (hy3/hy4/deepseek...); aiProxy already returns a Chat
+ *              Completions object.
+ *   - "image": createImageModel("cloudbase").generateImage -> the
+ *              hy-image-v3.5-preview image model. aiProxy passes the
+ *              CloudBase image result through verbatim; this plugin
+ *              reshapes choices[0].delta.image into a Chat Completions
+ *              message (a markdown image + a structured `image` field), so
+ *              the same OpenAI-compatible surface works for both.
+ * Image requests allow a much longer timeout (900 s) and a larger payload
+ * (base64 reference images), per the official image-model docs.
  *
  * Magpie plugin contract (verified against https://usemagpie.ai/docs/zh/plugins
  * on 2026-11-09):
@@ -36,7 +48,7 @@
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
 
-export const PLUGIN_VERSION = "0.2.5" as const;
+export const PLUGIN_VERSION = "0.3.0" as const;
 
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
@@ -44,8 +56,14 @@ const PROVIDER_ID = "cloudbase";
 const PROVIDER_ID_FALLBACK_PREFIX = "cloudbase-plugin/";
 
 const DEFAULT_FUNCTION_NAME = "aiProxy";
-const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s function timeout
+const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s text timeout
+// Image generation (especially 4K) is slow; the official docs recommend a
+// 900 s cloud-function timeout. Give image requests that much headroom.
+const IMAGE_TIMEOUT_MS = 900_000;
 const DEFAULT_MAX_EVENT_BYTES = 512 * 1024;
+// Base64 reference images can be large (single image <= 20 MB in the image
+// API). Keep a generous but bounded ceiling for image events.
+const IMAGE_MAX_EVENT_BYTES = 8 * 1024 * 1024;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
 
@@ -68,10 +86,12 @@ const GATEWAY_SUFFIX_INTL = ".api.intl.tcloudbasegateway.com";
  *   the deployed function's allowlist (see the `provider.models` hook).
  *   Official docs do not list `hy4-flash` yet; its 1M context follows the
  *   hy4 family — adjust if your console says otherwise.
- * - `hy-image-v3.5-preview` is an image-generation model and is NOT in this
- *   catalog: this bridge only does text chat (generateText).
  *
  * `verified` means "enabled by default", not "officially documented".
+ *
+ * Image-generation models live in a separate IMAGE_MODEL_CATALOG below:
+ * they use createImageModel/generateImage (Chat/Messages protocol), not
+ * generateText, and are routed with event.action = "image".
  */
 interface ModelSpec {
   name: string;
@@ -88,6 +108,31 @@ const MODEL_CATALOG: Readonly<Record<string, ModelSpec>> = {
   "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 1_000_000, output: 16_384, verified: true },
   "deepseek-v4.1-flash-1017": { name: "DeepSeek V4.1 Flash 1017", context: 1_000_000, output: 16_384, verified: true },
 };
+
+/**
+ * Image-generation model catalog. `hy-image-v3.5-preview` is the growth-plan
+ * image model (the quota screenshot shows 100K image generations). It speaks
+ * the Chat/Messages protocol and returns choices[0].delta.image; this plugin
+ * reshapes that into a Chat Completions markdown image.
+ * Docs: https://docs.cloudbase.net/ai/image-model/hy-image-3.5-preview
+ *
+ * `context`/`output` are nominal (the image model has no token context in
+ * the chat sense); they only satisfy the provider model-spec shape.
+ */
+interface ImageModelSpec {
+  name: string;
+  context: number;
+  output: number;
+  verified: boolean;
+}
+
+const IMAGE_MODEL_CATALOG: Readonly<Record<string, ImageModelSpec>> = {
+  "hy-image-v3.5-preview": { name: "Hunyuan Image 3.5 Preview", context: 32_768, output: 16_384, verified: true },
+};
+
+function isImageModel(model: string): boolean {
+  return model in IMAGE_MODEL_CATALOG;
+}
 
 /* ------------------------------------------------------------------ *
  * Minimal structural types (no runtime dependencies).                *
@@ -146,6 +191,14 @@ interface ChatCompletionsBody {
   max_completion_tokens?: unknown;
   tools?: unknown;
   tool_choice?: unknown;
+  // --- image-generation extras (hy-image-v3.5-preview) ---
+  size?: unknown;
+  seed?: unknown;
+  generate_max_pixels?: unknown;
+  resize_max_pixels?: unknown;
+  session?: unknown;
+  footnote?: unknown;
+  use_search_tool?: unknown;
 }
 
 interface ToolCall {
@@ -374,7 +427,7 @@ function mapGatewayError(
     case "FUNCTIONS_TIME_LIMIT_EXCEEDED":
       return errorResponse(
         504,
-        `The aiProxy cloud function timed out (FUNCTIONS_TIME_LIMIT_EXCEEDED). Raise its timeout to 120 s in the CloudBase console/CLI. Upstream: ${upstream}`,
+        `The aiProxy cloud function timed out (FUNCTIONS_TIME_LIMIT_EXCEEDED). Raise its timeout to 900 s (image generation) / 120 s for text-only functions in the CloudBase console/CLI. Upstream: ${upstream}`,
         { code, requestId },
       );
     case "FUNCTIONS_INVOCATION_FAILED":
@@ -408,6 +461,7 @@ function mapFunctionError(
   switch (code) {
     case "INVALID_REQUEST":
     case "IMAGE_INPUT_NOT_SUPPORTED":
+    case "IMAGE_REQUEST_INVALID":
     case "AI_MODEL_PARAM_INVALID":
       return errorResponse(400, message, { code, requestId: innerRequestId });
     case "MODEL_NOT_ALLOWED":
@@ -437,7 +491,27 @@ function mapFunctionError(
  * Chat Completions <-> aiProxy adapters.                             *
  * ------------------------------------------------------------------ */
 
+/**
+ * Build the aiProxy invocation event. Text models use action "chat";
+ * image models use action "image" and carry the image-model extras straight
+ * through (the cloud function validates them before calling generateImage).
+ */
 function buildInvokeEvent(body: ChatCompletionsBody, model: string): Json {
+  if (isImageModel(model)) {
+    const event: Json = { action: "image", model, messages: body.messages };
+    if (typeof body.size === "string") event.size = body.size;
+    if (typeof body.seed === "number" && Number.isInteger(body.seed)) event.seed = body.seed;
+    for (const key of ["generate_max_pixels", "resize_max_pixels"] as const) {
+      if (typeof body[key] === "number" && Number.isInteger(body[key])) event[key] = body[key];
+    }
+    if (typeof body.session === "string" && body.session.length > 0) event.session = body.session;
+    if (typeof body.footnote === "string" && body.footnote.length > 0) event.footnote = body.footnote;
+    if (isPlainObject(body.use_search_tool) && typeof body.use_search_tool.value === "boolean") {
+      event.use_search_tool = { value: body.use_search_tool.value };
+    }
+    return event;
+  }
+
   const event: Json = { action: "chat", model, messages: body.messages };
   if (typeof body.temperature === "number" && Number.isFinite(body.temperature)) {
     event.temperature = body.temperature;
@@ -466,6 +540,11 @@ interface NormalizedCompletion {
   toolCalls: ToolCall[];
   finishReason: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+  /** Present only for image results: the structured CloudBase image payload
+   * (url/width/height/assembled_history/request_id/...), so callers that
+   * talk to the plugin directly can consume the raw image, not just the
+   * markdown rendering in `content`. */
+  image?: Json;
 }
 
 /**
@@ -512,6 +591,58 @@ function normalizeCompletion(value: unknown): NormalizedCompletion | null {
     toolCalls,
     finishReason,
     usage,
+  };
+}
+
+/**
+ * Adapt a CloudBase generateImage result (passed through verbatim by
+ * aiProxy's image action) into a NormalizedCompletion. The delivered image
+ * is choices[0].delta.image; we render it as a markdown image in `content`
+ * so any OpenAI-compatible agent can display/reference it, and keep the
+ * full structured payload in `image` for programmatic consumers.
+ *
+ * Returns null when there is no usable image (the cloud function already
+ * guards this, but the plugin stays defensive).
+ */
+function adaptImageResult(value: unknown): NormalizedCompletion | null {
+  if (!isPlainObject(value)) return null;
+  const choices = Array.isArray(value.choices) ? value.choices : null;
+  const first = choices && isPlainObject(choices[0]) ? choices[0] : null;
+  const delta = first && isPlainObject(first.delta) ? first.delta : null;
+  const image = delta && isPlainObject(delta.image) ? delta.image : null;
+  const url = image && typeof image.url === "string" ? image.url : "";
+  if (!url) return null;
+
+  const width = typeof image?.width === "number" ? image.width : null;
+  const height = typeof image?.height === "number" ? image.height : null;
+  const sizeLabel = width && height ? `${width}x${height}` : "unknown size";
+  const content =
+    `![generated image](${url})\n\n` +
+    `_Generated image (${sizeLabel}). The URL is temporary and expires in 12h — download it or transfer it to cloud storage before then._`;
+
+  const structured: Json = {
+    url,
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+    ...(typeof image?.source === "string" ? { source: image.source } : {}),
+    ...(typeof image?.tool_call_id === "string" ? { tool_call_id: image.tool_call_id } : {}),
+  };
+  if (Array.isArray(value.assembled_history)) structured.assembled_history = value.assembled_history;
+  if (typeof value.request_id === "string") structured.request_id = value.request_id;
+  if (typeof value.id === "string") structured.trace_id = value.id;
+
+  const total = isPlainObject(value.usage) && typeof value.usage.total_tokens === "number"
+    ? value.usage.total_tokens
+    : 0;
+  return {
+    id: typeof value.id === "string" ? `imgcmpl-${value.id}` : `imgcmpl-${Date.now().toString(36)}`,
+    created: typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000),
+    model: typeof value.model === "string" ? value.model : "",
+    content,
+    toolCalls: [],
+    finishReason: "stop",
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: total },
+    image: structured,
   };
 }
 
@@ -604,6 +735,7 @@ function jsonCompletionResponse(completion: NormalizedCompletion, echoModel: str
     ],
   };
   if (completion.usage) payload.usage = completion.usage;
+  if (completion.image) payload.image = completion.image;
   return new Response(JSON.stringify(payload), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -643,7 +775,7 @@ function resolveAccountConfig(
 
   const timeoutRaw = mergedOptions.timeoutMs;
   const timeoutMs =
-    typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw >= 250 && timeoutRaw <= 600_000
+    typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw >= 250 && timeoutRaw <= 900_000
       ? timeoutRaw
       : DEFAULT_TIMEOUT_MS;
 
@@ -695,8 +827,9 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
   if (!model) {
     return errorResponse(400, "Missing model id after removing the provider prefix.", { code: "INVALID_REQUEST" });
   }
-  if (!(model in MODEL_CATALOG)) {
-    const known = Object.keys(MODEL_CATALOG).join(", ");
+  const imageRequest = isImageModel(model);
+  if (!(model in MODEL_CATALOG) && !imageRequest) {
+    const known = [...Object.keys(MODEL_CATALOG), ...Object.keys(IMAGE_MODEL_CATALOG)].join(", ");
     return errorResponse(
       404,
       `Model "${truncate(model, 64)}" is not in the CloudBase Bridge catalog. Known models: ${known}.`,
@@ -709,18 +842,24 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
   const payload = JSON.stringify(event);
   // Measure real UTF-8 bytes: string .length counts UTF-16 code units and
   // under-reports CJK content (each CJK char is typically 3 bytes but 1-2 units).
+  // Image events get a larger ceiling because base64 reference images are big.
   const payloadBytes = new TextEncoder().encode(payload).byteLength;
-  if (payloadBytes > DEFAULT_MAX_EVENT_BYTES) {
+  const maxEventBytes = imageRequest ? IMAGE_MAX_EVENT_BYTES : DEFAULT_MAX_EVENT_BYTES;
+  if (payloadBytes > maxEventBytes) {
+    const hint = imageRequest ? "Use a public image URL instead of a large base64 reference." : "Trim the history and retry.";
     return errorResponse(
       413,
-      `Conversation payload too large (${payloadBytes} bytes; limit ${DEFAULT_MAX_EVENT_BYTES} bytes). Trim the history and retry.`,
+      `Conversation payload too large (${payloadBytes} bytes; limit ${maxEventBytes} bytes). ${hint}`,
       { code: "PAYLOAD_TOO_LARGE" },
     );
   }
 
-  log("debug", `invoke ${cfg.functionName} model=${model} stream=${stream} bytes=${payloadBytes}`);
+  log("debug", `invoke ${cfg.functionName} action=${imageRequest ? "image" : "chat"} model=${model} stream=${stream} bytes=${payloadBytes}`);
 
-  const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
+  // Image generation is far slower than text chat; give it the documented
+  // 900 s headroom regardless of the (text-oriented) default timeout.
+  const effectiveTimeoutMs = imageRequest ? Math.max(cfg.timeoutMs, IMAGE_TIMEOUT_MS) : cfg.timeoutMs;
+  const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
   const signal = combineSignals(init?.signal, timeoutSignal);
 
   let upstream: Response;
@@ -745,10 +884,13 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
       throw error;
     }
     if (timeoutSignal.aborted) {
-      log("warn", `invoke timeout after ${cfg.timeoutMs} ms (model=${model})`);
+      log("warn", `invoke timeout after ${effectiveTimeoutMs} ms (model=${model})`);
+      const timeoutHint = imageRequest
+        ? "Image generation is slow (4K especially) — make sure the aiProxy cloud function timeout is 900 s."
+        : "Raise the aiProxy timeout (900 s when it also serves image generation) or options.timeoutMs.";
       return errorResponse(
         504,
-        `CloudBase function invocation timed out after ${Math.round(cfg.timeoutMs / 1000)} s. Raise the aiProxy timeout (recommended 120 s) or options.timeoutMs.`,
+        `CloudBase function invocation timed out after ${Math.round(effectiveTimeoutMs / 1000)} s. ${timeoutHint}`,
         { code: "INVOKE_TIMEOUT" },
       );
     }
@@ -784,12 +926,17 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
     return mapped;
   }
 
-  const completion = normalizeCompletion(functionResult);
+  // Image action: aiProxy returns the CloudBase generateImage result verbatim.
+  // Reshape choices[0].delta.image into a Chat Completions message, then reuse
+  // the same JSON/SSE responders as text chat.
+  const completion = imageRequest ? adaptImageResult(functionResult) : normalizeCompletion(functionResult);
   if (!completion) {
-    log("error", "aiProxy reply is not a Chat Completions object");
+    log("error", imageRequest ? "aiProxy image reply has no delta.image" : "aiProxy reply is not a Chat Completions object");
     return errorResponse(
       502,
-      "aiProxy reply is missing `choices[0].message`. Make sure the deployed aiProxy matches this plugin version (see docs/deploy-aiproxy.md).",
+      imageRequest
+        ? "aiProxy image reply is missing `choices[0].delta.image.url`. Make sure the deployed aiProxy supports action \"image\" (v1.2.0+) and that hy-image-v3.5-preview is available in your environment."
+        : "aiProxy reply is missing `choices[0].message`. Make sure the deployed aiProxy matches this plugin version (see docs/deploy-aiproxy.md).",
       { code: "INVALID_FUNCTION_RESPONSE" },
     );
   }
@@ -798,7 +945,7 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
   const totalTokens = completion.usage?.total_tokens;
   log(
     "info",
-    `invoke ok model=${model} stream=${stream} ${durationMs} ms tokens=${typeof totalTokens === "number" ? totalTokens : "n/a"}`,
+    `invoke ok action=${imageRequest ? "image" : "chat"} model=${model} stream=${stream} ${durationMs} ms tokens=${typeof totalTokens === "number" ? totalTokens : "n/a"}`,
   );
 
   // Echo the model id exactly as the agent requested it (prefix included)
@@ -816,6 +963,8 @@ interface PingResult {
   version?: string;
   env?: string | null;
   models?: unknown;
+  /** Image models reported by aiProxy v1.2.0+ (older functions omit it). */
+  imageModels?: unknown;
 }
 
 async function invokePing(cfg: AccountConfig): Promise<PingResult> {
@@ -877,17 +1026,30 @@ export const CloudbaseBridge = async (
         npm: "@ai-sdk/openai-compatible",
         // loader.baseURL always overrides this; keep a harmless placeholder.
         api: `https://placeholder${GATEWAY_SUFFIX_CN}/v1`,
-        models: Object.fromEntries(
-          Object.entries(MODEL_CATALOG).map(([id, spec]) => [
-            id,
-            {
-              name: spec.name,
-              limit: { context: spec.context, output: spec.output },
-              tool_call: true,
-              ...(spec.verified ? {} : { disabled: true }),
-            },
-          ]),
-        ),
+        models: {
+          ...Object.fromEntries(
+            Object.entries(MODEL_CATALOG).map(([id, spec]) => [
+              id,
+              {
+                name: spec.name,
+                limit: { context: spec.context, output: spec.output },
+                tool_call: true,
+                ...(spec.verified ? {} : { disabled: true }),
+              },
+            ]),
+          ),
+          ...Object.fromEntries(
+            Object.entries(IMAGE_MODEL_CATALOG).map(([id, spec]) => [
+              id,
+              {
+                name: spec.name,
+                limit: { context: spec.context, output: spec.output },
+                tool_call: false,
+                ...(spec.verified ? {} : { disabled: true }),
+              },
+            ]),
+          ),
+        },
       };
     },
 
@@ -952,9 +1114,11 @@ export const CloudbaseBridge = async (
       id: PROVIDER_ID,
 
       /**
-       * Refine the per-account model list from aiProxy's allowlist
-       * (`{ action: "ping" }`). On any failure keep provider.models so
-       * Magpie falls back gracefully, per the plugin docs.
+       * Refine the per-account model list from aiProxy's allowlists
+       * (`{ action: "ping" }` returns `models` + `imageModels` on v1.2.0+).
+       * Older functions omit `imageModels`, in which case image models simply
+       * don't appear until the function is redeployed. On any failure keep
+       * provider.models so Magpie falls back gracefully, per the plugin docs.
        */
       async models(provider: { models?: Record<string, Json> }, ctx?: { auth?: AuthData }) {
         const base = provider.models ?? {};
@@ -962,17 +1126,20 @@ export const CloudbaseBridge = async (
         if (!cfg) return base;
         try {
           const ping = await invokePing(cfg);
-          const pingModels = Array.isArray(ping.models) ? ping.models.filter((m): m is string => typeof m === "string") : [];
-          if (pingModels.length === 0) return base;
+          const asStrings = (value: unknown): string[] =>
+            Array.isArray(value) ? value.filter((m): m is string => typeof m === "string") : [];
+          const allowedIds = [...new Set([...asStrings(ping.models), ...asStrings(ping.imageModels)])];
+          if (allowedIds.length === 0) return base;
           const out: Record<string, Json> = {};
-          for (const id of pingModels) {
-            const known = MODEL_CATALOG[id];
+          for (const id of allowedIds) {
+            const image = isImageModel(id);
+            const known = image ? IMAGE_MODEL_CATALOG[id] : MODEL_CATALOG[id];
             const entry: Json = base[id]
               ? { ...base[id] }
               : {
                   name: known?.name ?? id,
                   limit: { context: known?.context ?? 131_072, output: known?.output ?? 16_384 },
-                  tool_call: true,
+                  tool_call: !image,
                 };
             // The deployed function's allowlist explicitly accepts this id
             // (it just said so in the ping), so a static placeholder
@@ -980,7 +1147,7 @@ export const CloudbaseBridge = async (
             delete entry.disabled;
             out[id] = entry;
           }
-          log("info", `account model list refreshed from aiProxy: ${pingModels.length} model(s)`);
+          log("info", `account model list refreshed from aiProxy: ${allowedIds.length} model(s)`);
           return out;
         } catch (error) {
           const reason = error instanceof Error ? truncate(error.message, 160) : "unknown";
@@ -1005,8 +1172,12 @@ export const _internal = {
   PROVIDER_ID,
   DEFAULT_FUNCTION_NAME,
   DEFAULT_TIMEOUT_MS,
+  IMAGE_TIMEOUT_MS,
   DEFAULT_MAX_EVENT_BYTES,
+  IMAGE_MAX_EVENT_BYTES,
   MODEL_CATALOG,
+  IMAGE_MODEL_CATALOG,
+  isImageModel,
   isValidEnvId,
   isValidFunctionName,
   gatewayBase,
@@ -1015,6 +1186,7 @@ export const _internal = {
   resolveAccountConfig,
   buildInvokeEvent,
   normalizeCompletion,
+  adaptImageResult,
   chunkText,
   sseResponse,
   jsonCompletionResponse,

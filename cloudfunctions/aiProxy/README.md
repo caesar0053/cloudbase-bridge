@@ -2,11 +2,20 @@
 
 A normal (Event) CloudBase cloud function that calls CloudBase AI models via
 `@cloudbase/node-sdk` and returns an OpenAI Chat Completions compatible JSON
-reply. The **CloudBase Bridge** Magpie plugin invokes this function through
-the official function-invocation HTTP endpoint, so **the function must be
-deployed in the same CloudBase environment as the API Key you configure in
-the plugin**, under the name **`aiProxy`** (or a custom name you also set
-during plugin login).
+reply (text chat) or the raw CloudBase image result (image generation) that
+the **CloudBase Bridge** Magpie plugin reshapes. The plugin invokes this
+function through the official function-invocation HTTP endpoint, so **the
+function must be deployed in the same CloudBase environment as the API Key
+you configure in the plugin**, under the name **`aiProxy`** (or a custom name
+you also set during plugin login).
+
+Two channels share this function, selected by `event.action`:
+
+| action | SDK call | Models | Reply |
+| --- | --- | --- | --- |
+| `chat` | `ai.createModel("cloudbase").generateText(...)` | `hy3`/`hy4`/`deepseek…` | OpenAI Chat Completions JSON |
+| `image` | `ai.createImageModel("cloudbase").generateImage(...)` | `hy-image-v3.5-preview` | CloudBase `image.chat.completion.chunk`, passed through verbatim |
+| `ping` | — | — | `{ ok, service, version, env, models, imageModels }` |
 
 Why a cloud function? The "小程序成长计划" (mini-program growth plan) AI
 quota is only spendable from CloudBase SDK channels — direct calls to
@@ -19,7 +28,7 @@ automatically.
 | File | Purpose |
 | --- | --- |
 | `index.js` | Function entry: `exports.main(event, context)` |
-| `package.json` | Declares `@cloudbase/node-sdk` (^3.16.0, required for AI features) |
+| `package.json` | Declares `@cloudbase/node-sdk` (**^3.18.3**, required for `hy-image-v3.5-preview`: it resolves `@cloudbase/ai >= 2.32.0`) |
 
 ## What it accepts
 
@@ -48,13 +57,50 @@ The function never runs a tool itself: it asks the model for one step and
 returns the model's `tool_calls` (with `finish_reason: "tool_calls"`) to
 the caller.
 
-Image parts are rejected with `IMAGE_INPUT_NOT_SUPPORTED` because the
-`generateText` input carries plain string content.
+**Chat** image parts are rejected with `IMAGE_INPUT_NOT_SUPPORTED` because
+the `generateText` input carries plain string content. To generate an image,
+use `action: "image"` instead (below) — that channel accepts `image_url`
+reference images.
+
+### Image event (`action: "image"`)
+
+The plugin builds this from a Chat Completions request whose model is an
+image-generation model (`hy-image-v3.5-preview`):
+
+```jsonc
+{
+  "action": "image",
+  "model": "hy-image-v3.5-preview",
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "一只在沙滩上奔跑的金毛犬" }] }
+  ],
+  // optional (see https://docs.cloudbase.net/ai/image-model/hy-image-3.5-preview)
+  "size": "1024x1024",            // sides 256..8192, area <= 4096x4096; 4K needs this
+  "seed": 42,                     // integer >= 0
+  "generate_max_pixels": 2359296, // 1048576 | 2359296 | 4194304 (ignored if size set)
+  "resize_max_pixels": 1048576,   // reference-image area cap
+  "session": "demo-session-001",  // keep stable across multi-turn edits
+  "footnote": "by-bridge",        // watermark, <= 16 chars
+  "use_search_tool": { "value": false }
+}
+```
+
+`messages[].content` may be a plain string (converted to a single `text`
+part) or an array of `{ type: "text", text }` and
+`{ type: "image_url", image_url: { url } }` parts (public URL or Base64 data
+URL; single image ≤ 20 MB, up to 20 images). For multi-turn editing, replay
+the previous reply's `assembled_history` plus a new `user` message; the
+function keeps `reasoning`, `tool_calls` and `tool_call_id` verbatim.
+
+Invalid fields are rejected with `IMAGE_REQUEST_INVALID`; a model outside
+the image allowlist with `MODEL_NOT_ALLOWED`.
 
 ## What it returns
 
-Success — OpenAI Chat Completions JSON (this is the raw HTTP body; the
-function-invocation API has no wrapper envelope):
+Success — the raw HTTP body (the function-invocation API has no wrapper
+envelope).
+
+**Chat** — OpenAI Chat Completions JSON:
 
 ```json
 {
@@ -67,10 +113,31 @@ function-invocation API has no wrapper envelope):
 }
 ```
 
+**Image** — the CloudBase `generateImage` result, passed through **verbatim**
+so no information (e.g. `assembled_history`) is lost. The plugin renders
+`choices[0].delta.image.url` as a markdown image:
+
+```json
+{
+  "id": "trace-…",
+  "object": "image.chat.completion.chunk",
+  "created": 1762700000,
+  "model": "internal-hy-image",
+  "choices": [{ "index": 0, "delta": { "image": { "url": "https://…", "width": 1024, "height": 1024 } }, "finish_reason": null }],
+  "usage": { "total_tokens": 20 },
+  "request_id": "…",
+  "assembled_history": [ … ]
+}
+```
+
+> The image URL is temporary (**12 hours**). Download it or transfer it to
+> CloudBase cloud storage before it expires.
+
 Failure — `{ "error": { "code": "…", "message": "…", "requestId": "…" } }`
-with codes such as `INVALID_REQUEST`, `MODEL_NOT_ALLOWED`,
-`AI_CHANNEL_NOT_ALLOWED`, `AI_MODEL_NOT_SUPPORTED`,
-`EXCEED_TOKEN_QUOTA_LIMIT`, `TCB_ENV_MISSING`, `UPSTREAM_ERROR`.
+with codes such as `INVALID_REQUEST`, `IMAGE_INPUT_NOT_SUPPORTED`,
+`IMAGE_REQUEST_INVALID`, `MODEL_NOT_ALLOWED`, `AI_CHANNEL_NOT_ALLOWED`,
+`AI_MODEL_NOT_SUPPORTED`, `EXCEED_TOKEN_QUOTA_LIMIT`, `TCB_ENV_MISSING`,
+`UPSTREAM_ERROR`.
 
 ## Deploy — Option A: console (控制台上传)
 
@@ -79,22 +146,25 @@ with codes such as `INVALID_REQUEST`, `MODEL_NOT_ALLOWED`,
    - Name: `aiProxy`
    - Runtime: **Nodejs18.15**（或更新；创建后运行时不可更改）
    - Function type: **事件函数 (Event Function)**
-   - Memory: 256 MB, **Timeout: 120 s**（文本生成较慢，默认 20 s 不够）
+   - Memory: 512 MB, **Timeout: 900 s**（生图很慢，4K 更久；官方生图文档建议 900 s。文本生成 120 s 够，但两者共用同一函数，取大值）
 3. Paste `index.js` as the entry (execution method `index.main`), and
    `package.json` alongside it. Enable **云端安装依赖 (installDependency)**
    so `@cloudbase/node-sdk` is installed by the platform, or zip the folder
    with `node_modules` included.
+   **Upgrading from aiProxy 1.1.0?** You MUST bump `@cloudbase/node-sdk`
+   to `^3.18.3` and let the platform reinstall dependencies (delete any
+   uploaded `node_modules`): `hy-image-v3.5-preview` needs
+   `@cloudbase/ai >= 2.32.0`, which only that node-sdk range resolves.
 4. Environment variables: none required — **`TCB_ENV` is injected by the
    CloudBase runtime automatically**. Optionally set
-   `AI_PROXY_ALLOWED_MODELS` (comma-separated model ids) to restrict or
-   extend the allowlist; the default is
+   `AI_PROXY_ALLOWED_MODELS` (comma-separated text model ids) — default
    `hy4-flash,hy4,hy4-preview,hy3,deepseek-v4.1-flash,deepseek-v4.1-flash-1017`
-   (`deepseek-v4.1-flash-1017` I verified in my own environment, though it
-   is not in the official growth-plan notice; `hy4` is an unverified
-   placeholder. CloudBase itself rejects ids it does not support with
-   `AI_MODEL_NOT_SUPPORTED`).
+   — and `AI_PROXY_ALLOWED_IMAGE_MODELS` (default
+   `hy-image-v3.5-preview`). CloudBase itself rejects unsupported ids with
+   `AI_MODEL_NOT_SUPPORTED`.
 5. Deploy, then verify with the console's inline test: invoke with
-   `{"action":"ping"}` — expect `{"ok":true,"service":"aiProxy",...}`.
+   `{"action":"ping"}` — expect `{"ok":true,"service":"aiProxy","version":"1.2.0","models":[…],"imageModels":[…]}`. The
+   `imageModels` field is what makes the plugin offer the image model.
 
 ## Deploy — Option B: CLI (`tcb fn deploy`)
 
@@ -112,8 +182,17 @@ tcb fn invoke aiProxy --params '{"action":"ping"}'
 ```
 
 `installDependency: true` in the example config makes the platform install
-`@cloudbase/node-sdk` from `package.json` (do **not** also upload
-`node_modules`, they conflict).
+`@cloudbase/node-sdk@^3.18.3` from `package.json` (do **not** also upload
+`node_modules`, they conflict). The example config sets `timeout: 900` and
+`memorySize: 512` for image generation.
+
+Verify both channels without Magpie:
+
+```bash
+tcb fn invoke aiProxy --params '{"action":"ping"}'
+tcb fn invoke aiProxy --params '{"action":"image","model":"hy-image-v3.5-preview","messages":[{"role":"user","content":"一只橘猫"}],"size":"1024x1024"}'
+# image call returns choices[0].delta.image.url, width, height
+```
 
 ## Security notes
 
@@ -125,5 +204,8 @@ tcb fn invoke aiProxy --params '{"action":"ping"}'
   normally pass the default rule; if you see `EXCEED_AUTHORITY`, review the
   function security rules in the console
   (see `docs/troubleshooting.md`).
-- Size limits: ≤128 messages, ≤200 000 chars per message, ≤400 000 chars
-  total — keep agents from burning quota with runaway histories.
+- Size limits — chat: ≤128 messages, ≤200 000 chars per message, ≤400 000
+  chars total; image: ≤64 messages, ≤2 000 000 chars per message (base64
+  reference images), ≤8 000 000 chars total. These keep agents from burning
+  quota with runaway histories. The plugin additionally caps the serialized
+  event at 512 KiB (chat) / 8 MiB (image).

@@ -21,3 +21,6 @@ test-tmp/
 
 # 本机部署配置（含你的环境 ID），不入库
 cloudbaserc.json
+
+# 本地生成的云函数部署包，不入库
+aiProxy-deploy.zip

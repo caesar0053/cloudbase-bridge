@@ -65,9 +65,31 @@ function startMockGateway() {
           JSON.stringify({
             ok: true,
             service: "aiProxy",
-            version: "1.1.0",
+            version: "1.2.0",
             env: "env-mock",
             models: ["hy4-flash", "hy3", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"],
+            imageModels: ["hy-image-v3.5-preview"],
+          }),
+        );
+        return;
+      }
+      if (event.action === "image") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "trace-mock-img",
+            object: "image.chat.completion.chunk",
+            created: 1_762_700_000,
+            model: "internal-hy-image",
+            choices: [
+              {
+                index: 0,
+                delta: { image: { url: "https://example.com/mock.png", width: 1024, height: 1024, source: "generated" } },
+                finish_reason: null,
+              },
+            ],
+            usage: { total_tokens: 12 },
+            assembled_history: [],
           }),
         );
         return;
@@ -117,11 +139,12 @@ await okAsync("config hook declares the cloudbase provider with the model catalo
   const provider = cfg.provider?.cloudbase;
   assert.ok(provider, "provider.cloudbase missing");
   assert.equal(provider.npm, "@ai-sdk/openai-compatible");
-  for (const id of ["hy3", "hy4-preview", "deepseek-v4.1-flash", "hy4", "deepseek-v4.1-flash-1017"]) {
+  for (const id of ["hy3", "hy4-preview", "deepseek-v4.1-flash", "hy4", "deepseek-v4.1-flash-1017", "hy-image-v3.5-preview"]) {
     assert.ok(provider.models[id], `model ${id} missing`);
   }
   assert.ok(!provider.models.hy4.disabled);
   assert.equal(provider.models.hy4.tool_call, true);
+  assert.equal(provider.models["hy-image-v3.5-preview"].tool_call, false);
 });
 
 ok("auth hook shape: provider id, api method, prompts", () => {
@@ -149,8 +172,12 @@ await okAsync("provider.models refines the account model list via ping", async (
   const cfg = {};
   await hooksLive.config(cfg);
   const refined = await hooksLive.provider.models({ models: cfg.provider.cloudbase.models }, { auth });
-  assert.deepEqual(Object.keys(refined).sort(), ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "hy3", "hy4-flash"]);
+  assert.deepEqual(
+    Object.keys(refined).sort(),
+    ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "hy-image-v3.5-preview", "hy3", "hy4-flash"],
+  );
   assert.equal(refined["deepseek-v4.1-flash-1017"].disabled, undefined, "ping-allowed model must not stay disabled");
+  assert.equal(refined["hy-image-v3.5-preview"].disabled, undefined, "ping-allowed image model must not stay disabled");
 });
 
 await okAsync("end-to-end non-streaming request returns chat.completion JSON", async () => {
@@ -176,6 +203,26 @@ await okAsync("end-to-end streaming request returns SSE ending with [DONE]", asy
   const text = await res.text();
   assert.ok(text.endsWith("data: [DONE]\n\n"), "stream must end with data: [DONE]");
   assert.ok(text.includes('"delta":{"role":"assistant"'), "first chunk must carry the assistant role");
+});
+
+await okAsync("end-to-end image request routes to action:image and returns a markdown image", async () => {
+  const loader = await hooksLive.auth.loader(async () => auth);
+  const res = await loader.fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({
+      model: "cloudbase/hy-image-v3.5-preview",
+      messages: [{ role: "user", content: "画一只橘猫" }],
+      size: "1024x1024",
+      stream: false,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const payload = await res.json();
+  assert.equal(payload.object, "chat.completion");
+  assert.equal(payload.model, "cloudbase/hy-image-v3.5-preview");
+  assert.match(payload.choices[0].message.content, /!\[generated image\]\(https:\/\/example\.com\/mock\.png\)/);
+  assert.equal(payload.image.url, "https://example.com/mock.png");
+  assert.equal(payload.image.width, 1024);
 });
 
 await okAsync("gateway FUNCTIONS_NOT_FOUND maps to 404 with deploy hint", async () => {

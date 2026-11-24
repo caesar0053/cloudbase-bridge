@@ -613,3 +613,268 @@ test("nothing in logs or error payloads contains the API key or message content"
     gw.restore();
   }
 });
+
+/* ---------------- image generation ---------------- */
+
+const IMAGE_MODEL = "hy-image-v3.5-preview";
+
+/** A CloudBase generateImage result, exactly as aiProxy passes it through. */
+function aiProxyImageResult(overrides = {}) {
+  return {
+    id: "trace-img-1",
+    object: "image.chat.completion.chunk",
+    created: 1_762_700_000,
+    model: "internal-hy-image",
+    round: 0,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          type: "image",
+          image: {
+            url: "https://example.com/generated.png",
+            width: 1024,
+            height: 1024,
+            source: "generated",
+            tool_call_id: "call_img_1",
+          },
+        },
+        finish_reason: null,
+      },
+    ],
+    usage: { total_tokens: 20 },
+    request_id: "req-img-1",
+    assembled_history: [{ role: "tool", tool_call_id: "call_img_1", content: [] }],
+    ...overrides,
+  };
+}
+
+function imageBody(overrides = {}) {
+  return JSON.stringify({
+    model: IMAGE_MODEL,
+    messages: [{ role: "user", content: "画一只在沙滩上奔跑的金毛犬" }],
+    stream: false,
+    ...overrides,
+  });
+}
+
+test("isImageModel and the image catalog", () => {
+  assert.equal(_internal.isImageModel(IMAGE_MODEL), true);
+  assert.equal(_internal.isImageModel("hy3"), false);
+  assert.ok(_internal.IMAGE_MODEL_CATALOG[IMAGE_MODEL]);
+});
+
+test("config hook registers the image model with tool_call:false", async () => {
+  const { hooks } = await makePlugin();
+  const cfg = {};
+  await hooks.config(cfg);
+  const models = cfg.provider.cloudbase.models;
+  assert.ok(models[IMAGE_MODEL], "image model must be in the catalog");
+  assert.equal(models[IMAGE_MODEL].name, "Hunyuan Image 3.5 Preview");
+  assert.equal(models[IMAGE_MODEL].tool_call, false);
+  assert.ok(!models[IMAGE_MODEL].disabled);
+  // All six text models are still present and unchanged.
+  for (const id of ["hy4-flash", "hy3", "hy4", "hy4-preview", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"]) {
+    assert.ok(models[id] && models[id].tool_call === true);
+  }
+});
+
+test("buildInvokeEvent routes image models with all documented options", () => {
+  const event = _internal.buildInvokeEvent(
+    {
+      model: IMAGE_MODEL,
+      messages: [{ role: "user", content: [{ type: "text", text: "一只猫" }, { type: "image_url", image_url: { url: "https://x/ref.png" } }] }],
+      size: "2048x2048",
+      seed: 7,
+      generate_max_pixels: 4_194_304,
+      resize_max_pixels: 1_048_576,
+      session: "s1",
+      footnote: "bridge",
+      use_search_tool: { value: true },
+    },
+    IMAGE_MODEL,
+  );
+  assert.equal(event.action, "image");
+  assert.equal(event.model, IMAGE_MODEL);
+  assert.equal(event.size, "2048x2048");
+  assert.equal(event.seed, 7);
+  assert.equal(event.generate_max_pixels, 4_194_304);
+  assert.equal(event.resize_max_pixels, 1_048_576);
+  assert.equal(event.session, "s1");
+  assert.equal(event.footnote, "bridge");
+  assert.deepEqual(event.use_search_tool, { value: true });
+  assert.equal("temperature" in event, false, "chat-only fields must not leak into image events");
+
+  const chat = _internal.buildInvokeEvent({ model: "hy3", messages: [{ role: "user", content: "hi" }], temperature: 0.5 }, "hy3");
+  assert.equal(chat.action, "chat");
+  assert.equal(chat.temperature, 0.5);
+});
+
+test("adaptImageResult reshapes the image into markdown + structured payload", () => {
+  const completion = _internal.adaptImageResult(aiProxyImageResult());
+  assert.ok(completion);
+  assert.match(completion.content, /!\[generated image\]\(https:\/\/example\.com\/generated\.png\)/);
+  assert.match(completion.content, /1024x1024/);
+  assert.match(completion.content, /12h/);
+  assert.equal(completion.image.url, "https://example.com/generated.png");
+  assert.equal(completion.image.width, 1024);
+  assert.equal(completion.image.request_id, "req-img-1");
+  assert.ok(Array.isArray(completion.image.assembled_history));
+  assert.equal(completion.usage.total_tokens, 20);
+  assert.equal(completion.finishReason, "stop");
+
+  assert.equal(_internal.adaptImageResult({ choices: [{ delta: {} }] }), null);
+  assert.equal(_internal.adaptImageResult("nope"), null);
+});
+
+test("bridge non-streaming image: sends action:image, returns markdown + image field", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyImageResult()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(imageBody({ model: `cloudbase/${IMAGE_MODEL}`, size: "1024x1024", session: "s1" }));
+    assert.equal(res.status, 200);
+
+    const sentEvent = JSON.parse(gw.calls[0].init.body);
+    assert.equal(sentEvent.action, "image");
+    assert.equal(sentEvent.model, IMAGE_MODEL);
+    assert.equal(sentEvent.size, "1024x1024");
+    assert.equal(sentEvent.session, "s1");
+
+    const payload = await res.json();
+    assert.equal(payload.object, "chat.completion");
+    assert.equal(payload.model, `cloudbase/${IMAGE_MODEL}`, "must echo the requested model id");
+    assert.match(payload.choices[0].message.content, /!\[generated image\]/);
+    assert.equal(payload.choices[0].finish_reason, "stop");
+    assert.equal(payload.image.url, "https://example.com/generated.png");
+    assert.ok(Array.isArray(payload.image.assembled_history));
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge streaming image: synthesizes SSE carrying the markdown image", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyImageResult()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(imageBody({ stream: true }));
+    assert.ok((res.headers.get("content-type") ?? "").includes("text/event-stream"));
+    const frames = (await res.text())
+      .split("\n\n")
+      .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map((l) => JSON.parse(l.slice("data: ".length)));
+    const content = frames.map((f) => f.choices[0].delta.content ?? "").join("");
+    assert.match(content, /!\[generated image\]\(https:\/\/example\.com\/generated\.png\)/);
+    assert.equal(frames[frames.length - 1].choices[0].finish_reason, "stop");
+  } finally {
+    gw.restore();
+  }
+});
+
+test("bridge image errors: error envelope and shapeless reply", async () => {
+  const { hooks } = await makePlugin();
+  const envelope = mockGateway(async () =>
+    new Response(JSON.stringify({ error: { code: "IMAGE_REQUEST_INVALID", message: "bad size" } }), { status: 200 }),
+  );
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(imageBody());
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.code, "IMAGE_REQUEST_INVALID");
+  } finally {
+    envelope.restore();
+  }
+
+  const shapeless = mockGateway(async () => new Response(JSON.stringify({ choices: [{ delta: {} }] }), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(imageBody());
+    assert.equal(res.status, 502);
+    const payload = await res.json();
+    assert.equal(payload.error.code, "INVALID_FUNCTION_RESPONSE");
+    assert.match(payload.error.message, /delta\.image\.url/);
+  } finally {
+    shapeless.restore();
+  }
+});
+
+test("image requests use a larger payload ceiling than text chat", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyImageResult()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    // A ~600 KB base64 reference image: over the 512 KiB text limit, but
+    // well within the image ceiling.
+    const bigRef = "data:image/png;base64," + "A".repeat(600_000);
+    const res = await doFetch(
+      imageBody({ messages: [{ role: "user", content: [{ type: "text", text: "参考图" }, { type: "image_url", image_url: { url: bigRef } }] }] }),
+    );
+    assert.equal(res.status, 200, "large reference image must not hit the text payload limit");
+    const sentEvent = JSON.parse(gw.calls[0].init.body);
+    assert.equal(sentEvent.action, "image");
+    assert.ok(sentEvent.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"));
+  } finally {
+    gw.restore();
+  }
+
+  // The same payload on a text model is still rejected with 413.
+  const gw2 = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ messages: [{ role: "user", content: "x".repeat(600_000) }] }));
+    assert.equal(res.status, 413);
+  } finally {
+    gw2.restore();
+  }
+});
+
+test("provider.models merges imageModels from aiProxy ping", async () => {
+  const { hooks } = await makePlugin();
+  const base = {
+    hy3: { name: "Hunyuan 3", limit: { context: 262_144, output: 16_384 }, tool_call: true },
+    [IMAGE_MODEL]: { name: "Hunyuan Image 3.5 Preview", limit: { context: 32_768, output: 16_384 }, tool_call: false, disabled: true },
+  };
+  const gw = mockGateway(async () =>
+    new Response(
+      JSON.stringify({ ok: true, service: "aiProxy", version: "1.2.0", models: ["hy3"], imageModels: [IMAGE_MODEL] }),
+      { status: 200 },
+    ),
+  );
+  try {
+    const refined = await hooks.provider.models({ models: base }, { auth: fakeAuth() });
+    assert.ok(refined.hy3);
+    assert.ok(refined[IMAGE_MODEL], "image model from ping must be kept");
+    assert.equal(refined[IMAGE_MODEL].disabled, undefined, "ping-allowed image model loses its disabled flag");
+    assert.equal(refined[IMAGE_MODEL].tool_call, false);
+  } finally {
+    gw.restore();
+  }
+
+  // An older aiProxy (no imageModels field) drops the image model, as it
+  // cannot serve image requests anyway.
+  const gwOld = mockGateway(async () =>
+    new Response(JSON.stringify({ ok: true, version: "1.1.0", models: ["hy3"] }), { status: 200 }),
+  );
+  try {
+    const refined = await hooks.provider.models({ models: base }, { auth: fakeAuth() });
+    assert.ok(refined.hy3);
+    assert.equal(refined[IMAGE_MODEL], undefined);
+  } finally {
+    gwOld.restore();
+  }
+});
+
+test("unknown model error lists image models too", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response("{}", { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    const res = await doFetch(chatBody({ model: "dall-e-3" }));
+    assert.equal(res.status, 404);
+    assert.match((await res.json()).error.message, new RegExp(IMAGE_MODEL.replace(/[.]/g, "\\.")));
+    assert.equal(gw.calls.length, 0);
+  } finally {
+    gw.restore();
+  }
+});

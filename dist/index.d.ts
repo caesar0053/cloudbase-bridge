@@ -12,10 +12,22 @@
  * The growth-plan quota is only spendable from CloudBase SDK channels; direct
  * calls to the HTTP AI model endpoints (`/v1/ai/...`) are rejected with
  * `AI_CHANNEL_NOT_ALLOWED`. The cloud function therefore calls the model with
- * `@cloudbase/node-sdk` (`ai.createModel("cloudbase")` + `generateText`) and
- * returns a one-shot OpenAI-compatible JSON. This plugin adapts that JSON
- * into OpenAI Chat Completions responses and synthesizes SSE frames when the
- * agent requested `stream: true`.
+ * `@cloudbase/node-sdk`. This plugin adapts the JSON into OpenAI Chat
+ * Completions responses and synthesizes SSE frames when the agent requested
+ * `stream: true`.
+ *
+ * Two channels share the same `aiProxy` function, selected by event.action:
+ *   - "chat":  createModel("cloudbase").generateText  -> text chat models
+ *              (hy3/hy4/deepseek...); aiProxy already returns a Chat
+ *              Completions object.
+ *   - "image": createImageModel("cloudbase").generateImage -> the
+ *              hy-image-v3.5-preview image model. aiProxy passes the
+ *              CloudBase image result through verbatim; this plugin
+ *              reshapes choices[0].delta.image into a Chat Completions
+ *              message (a markdown image + a structured `image` field), so
+ *              the same OpenAI-compatible surface works for both.
+ * Image requests allow a much longer timeout (900 s) and a larger payload
+ * (base64 reference images), per the official image-model docs.
  *
  * Magpie plugin contract (verified against https://usemagpie.ai/docs/zh/plugins
  * on 2026-11-09):
@@ -30,7 +42,7 @@
  * - `dist/` must be committed so the GitHub-topic discovery path can load
  *   the plugin straight from the repository.
  */
-export declare const PLUGIN_VERSION: "0.2.5";
+export declare const PLUGIN_VERSION: "0.3.0";
 /**
  * Model catalog (text chat models).
  *
@@ -47,10 +59,12 @@ export declare const PLUGIN_VERSION: "0.2.5";
  *   the deployed function's allowlist (see the `provider.models` hook).
  *   Official docs do not list `hy4-flash` yet; its 1M context follows the
  *   hy4 family — adjust if your console says otherwise.
- * - `hy-image-v3.5-preview` is an image-generation model and is NOT in this
- *   catalog: this bridge only does text chat (generateText).
  *
  * `verified` means "enabled by default", not "officially documented".
+ *
+ * Image-generation models live in a separate IMAGE_MODEL_CATALOG below:
+ * they use createImageModel/generateImage (Chat/Messages protocol), not
+ * generateText, and are routed with event.action = "image".
  */
 interface ModelSpec {
     name: string;
@@ -58,6 +72,23 @@ interface ModelSpec {
     output: number;
     verified: boolean;
 }
+/**
+ * Image-generation model catalog. `hy-image-v3.5-preview` is the growth-plan
+ * image model (the quota screenshot shows 100K image generations). It speaks
+ * the Chat/Messages protocol and returns choices[0].delta.image; this plugin
+ * reshapes that into a Chat Completions markdown image.
+ * Docs: https://docs.cloudbase.net/ai/image-model/hy-image-3.5-preview
+ *
+ * `context`/`output` are nominal (the image model has no token context in
+ * the chat sense); they only satisfy the provider model-spec shape.
+ */
+interface ImageModelSpec {
+    name: string;
+    context: number;
+    output: number;
+    verified: boolean;
+}
+declare function isImageModel(model: string): boolean;
 type Json = Record<string, unknown>;
 interface AuthData {
     type?: string;
@@ -105,6 +136,13 @@ interface ChatCompletionsBody {
     max_completion_tokens?: unknown;
     tools?: unknown;
     tool_choice?: unknown;
+    size?: unknown;
+    seed?: unknown;
+    generate_max_pixels?: unknown;
+    resize_max_pixels?: unknown;
+    session?: unknown;
+    footnote?: unknown;
+    use_search_tool?: unknown;
 }
 interface ToolCall {
     id: string;
@@ -157,6 +195,11 @@ declare function mapGatewayError(status: number, body: {
  * ({ error: { code, message } } inside a 200 response).
  */
 declare function mapFunctionError(err: Json, requestId?: string): Response;
+/**
+ * Build the aiProxy invocation event. Text models use action "chat";
+ * image models use action "image" and carry the image-model extras straight
+ * through (the cloud function validates them before calling generateImage).
+ */
 declare function buildInvokeEvent(body: ChatCompletionsBody, model: string): Json;
 interface NormalizedCompletion {
     id: string;
@@ -170,12 +213,28 @@ interface NormalizedCompletion {
         completion_tokens: number;
         total_tokens: number;
     } | null;
+    /** Present only for image results: the structured CloudBase image payload
+     * (url/width/height/assembled_history/request_id/...), so callers that
+     * talk to the plugin directly can consume the raw image, not just the
+     * markdown rendering in `content`. */
+    image?: Json;
 }
 /**
  * Validate the aiProxy reply (an OpenAI Chat Completions object) well enough
  * to adapt it. Returns null when the shape is unusable.
  */
 declare function normalizeCompletion(value: unknown): NormalizedCompletion | null;
+/**
+ * Adapt a CloudBase generateImage result (passed through verbatim by
+ * aiProxy's image action) into a NormalizedCompletion. The delivered image
+ * is choices[0].delta.image; we render it as a markdown image in `content`
+ * so any OpenAI-compatible agent can display/reference it, and keep the
+ * full structured payload in `image` for programmatic consumers.
+ *
+ * Returns null when there is no usable image (the cloud function already
+ * guards this, but the plugin stays defensive).
+ */
+declare function adaptImageResult(value: unknown): NormalizedCompletion | null;
 /**
  * Synthesize an SSE stream from the one-shot completion. Frames follow the
  * OpenAI Chat Completions streaming format: a role chunk, content chunks
@@ -218,9 +277,11 @@ export declare const CloudbaseBridge: (input?: PluginInput, options?: PluginOpti
     provider: {
         id: string;
         /**
-         * Refine the per-account model list from aiProxy's allowlist
-         * (`{ action: "ping" }`). On any failure keep provider.models so
-         * Magpie falls back gracefully, per the plugin docs.
+         * Refine the per-account model list from aiProxy's allowlists
+         * (`{ action: "ping" }` returns `models` + `imageModels` on v1.2.0+).
+         * Older functions omit `imageModels`, in which case image models simply
+         * don't appear until the function is redeployed. On any failure keep
+         * provider.models so Magpie falls back gracefully, per the plugin docs.
          */
         models(provider: {
             models?: Record<string, Json>;
@@ -230,12 +291,16 @@ export declare const CloudbaseBridge: (input?: PluginInput, options?: PluginOpti
     };
 }>;
 export declare const _internal: {
-    PLUGIN_VERSION: "0.2.5";
+    PLUGIN_VERSION: "0.3.0";
     PROVIDER_ID: string;
     DEFAULT_FUNCTION_NAME: string;
     DEFAULT_TIMEOUT_MS: number;
+    IMAGE_TIMEOUT_MS: number;
     DEFAULT_MAX_EVENT_BYTES: number;
+    IMAGE_MAX_EVENT_BYTES: number;
     MODEL_CATALOG: Readonly<Record<string, ModelSpec>>;
+    IMAGE_MODEL_CATALOG: Readonly<Record<string, ImageModelSpec>>;
+    isImageModel: typeof isImageModel;
     isValidEnvId: typeof isValidEnvId;
     isValidFunctionName: typeof isValidFunctionName;
     gatewayBase: typeof gatewayBase;
@@ -244,6 +309,7 @@ export declare const _internal: {
     resolveAccountConfig: typeof resolveAccountConfig;
     buildInvokeEvent: typeof buildInvokeEvent;
     normalizeCompletion: typeof normalizeCompletion;
+    adaptImageResult: typeof adaptImageResult;
     chunkText: typeof chunkText;
     sseResponse: typeof sseResponse;
     jsonCompletionResponse: typeof jsonCompletionResponse;

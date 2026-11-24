@@ -93,19 +93,21 @@ wrong-type API Key (`PERMISSION_DENIED`), or an intercepted call
 
 **Which timeout fired?**
 - Error code `INVOKE_TIMEOUT` (HTTP 504) — the **plugin** gave up waiting for
-  the gateway (default 150 s). Raise the option `timeoutMs` — but first fix
-  the function timeout, which is usually the real bottleneck.
+  the gateway. Text chat uses the `timeoutMs` option (default 150 s);
+  **image requests automatically get 900 s**. Raise `timeoutMs` if needed —
+  but first fix the function timeout, which is usually the real bottleneck.
 - `FUNCTIONS_TIME_LIMIT_EXCEEDED` (HTTP 504) — **CloudBase killed the
   function**. The default function timeout (20 s) is far too short for AI
-  text generation; set it to **120 s** (console or
-  `cloudbaserc.json` → `"timeout": 120` → `tcb fn config update aiProxy`).
+  generation; set it to **900 s** (console or `cloudbaserc.json` →
+  `"timeout": 900` → `tcb fn config update aiProxy` / redeploy). Image
+  generation, especially 4K, genuinely needs this; text chat alone is fine
+  at 120 s, but both channels share one function.
 - Agent-side aborts (user pressed escape) simply cancel the request — no
   error payload, nothing to fix.
 
 **Also remember:** this bridge is one-shot upstream — long generations run to
 completion inside one function invocation. Very long outputs may still hit
-the 120 s ceiling; use a faster model (`deepseek-v4.1-flash`) or trim
-context.
+the ceiling; use a faster model (`deepseek-v4.1-flash`) or trim context.
 
 ## 6. Quota / concurrency (HTTP 429: `EXCEED_TOKEN_QUOTA_LIMIT`, `EXCEED_CONCURRENT_REQUEST_LIMIT`, `FUNCTIONS_EXCEED_RESOURCE_LIMIT`)
 
@@ -150,6 +152,24 @@ local `tcb fn run` quirk) it's absent.
 | `FUNCTIONS_STATUS_ABNORMAL` | 502 | Function is paused/frozen — check console |
 | `FUNCTIONS_EXCEED_RESOURCE_LIMIT` | 429 | Concurrency headroom exhausted — retry later |
 | anything else | passthrough | The upstream `message` is included; search it in the [CloudBase error-code list](https://docs.cloudbase.net/error-code/service) |
+
+## 10. Image generation (`hy-image-v3.5-preview`)
+
+| Symptom | Meaning | Fix |
+| --- | --- | --- |
+| The image model doesn't appear in the model list | The deployed aiProxy is older than 1.2.0 (its `ping` has no `imageModels`) | Redeploy `aiProxy` from this repo with `@cloudbase/node-sdk@^3.18.3` (reinstall dependencies) and a 900 s timeout |
+| `MODEL_NOT_ALLOWED` / `AI_MODEL_NOT_SUPPORTED` (404) | Model not in the image allowlist or not enabled in your environment | Check `AI_PROXY_ALLOWED_IMAGE_MODELS`; confirm the growth-plan image quota is active in the console. Some environments may not have the model |
+| `IMAGE_REQUEST_INVALID` (400) | A bad `size`/`seed`/`footnote`/`session`, or an unsupported `content` part | `size` must be `WxH` with sides 256–8192 and area ≤ 4096×4096; only `text` and `image_url` parts are accepted |
+| `aiProxy image reply is missing ... delta.image.url` (502) | The function answered without a usable image — often an outdated SDK or an upstream error | Redeploy with node-sdk ≥ 3.18.3; check function logs |
+| `PAYLOAD_TOO_LARGE` (413) | A base64 reference image exceeded the 8 MiB event cap | Use a public image URL instead of a large inline Base64, or resize it |
+| Content-safety error (400/422 upstream) | The prompt or reference image was blocked | Rephrase the prompt / change the reference image |
+| Generated image link is dead later | Image URLs expire after **12 hours** | Download it or transfer it to CloudBase cloud storage right away (see the [image docs](https://docs.cloudbase.net/ai/image-model/node-sdk)) |
+
+Verify the image channel directly, without Magpie:
+
+```bash
+tcb fn invoke aiProxy --params '{"action":"image","model":"hy-image-v3.5-preview","messages":[{"role":"user","content":"一只橘猫"}],"size":"1024x1024"}'
+```
 
 ## Quick diagnosis recipe
 

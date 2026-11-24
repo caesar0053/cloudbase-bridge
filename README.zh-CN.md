@@ -26,16 +26,31 @@ Agent ─► magpie 网关 ─► 插件 ── POST /v1/functions/aiProxy ─�
 
 ## 模型
 
-| 模型 ID | 上下文长度 |
-| --- | --- |
-| `hy4-flash` | 1M |
-| `hy4` | 1M |
-| `hy4-preview` | 1M |
-| `hy3` | 256K |
-| `deepseek-v4.1-flash` | 1M |
-| `deepseek-v4.1-flash-1017` | 1M |
+| 模型 ID | 类型 | 上下文 / 输出 |
+| --- | --- | --- |
+| `hy4-flash` | 文本对话 | 1M |
+| `hy4` | 文本对话 | 1M |
+| `hy4-preview` | 文本对话 | 1M |
+| `hy3` | 文本对话 | 256K |
+| `deepseek-v4.1-flash` | 文本对话 | 1M |
+| `deepseek-v4.1-flash-1017` | 文本对话 | 1M |
+| `hy-image-v3.5-preview` | **生图** | 最高 4096×4096 |
 
-这些模型不用在控制台开启，用量会自动从赠送额度里扣。个别模型在部分环境不一定放开——如果 CloudBase 返回 `AI_MODEL_NOT_SUPPORTED`，以你环境的实际支持为准。生图模型 `hy-image-v3.5-preview` 不在本插件范围内：桥接只走文本对话通道。
+这些模型不用在控制台开启，用量会自动从赠送额度里扣（文本走 Token、生图走赠送的 10 万张生图额度）。个别模型在部分环境不一定放开——如果 CloudBase 返回 `AI_MODEL_NOT_SUPPORTED`，以你环境的实际支持为准。
+
+### 用生图模型
+
+`hy-image-v3.5-preview` 走的是 Chat/Messages 协议（`createImageModel` + `generateImage`），和文本对话不是一条 SDK 通道，所以插件用 `action: "image"` 单独路由，但对外仍然是同一个 OpenAI 兼容供应商：
+
+- 在 agent 里选 `cloudbase/hy-image-v3.5-preview`，把提示词当作普通 user 消息发出去即可；
+- 返回的 `content` 是一段 markdown 图片 `![generated image](url)`，非流式响应还带一个结构化 `image` 字段（含 `url` / `width` / `height` / `assembled_history` / `request_id`），方便程序化消费；
+- 需要 4K、固定种子、水印或参考图时，可以在请求体里附加 `size`（如 `4096x4096`）、`seed`、`footnote`、`session`，或在 `messages[].content` 里混排 `{ type: "image_url", image_url: { url } }`（公网 URL 或 Base64）；
+- 多轮编辑：保持同一个 `session`，把上一轮 `image.assembled_history` 回灌到 `messages` 后再追加新的 user 消息（直接调云函数时能拿到完整字段）。
+
+> ⚠️ 图片 URL 是临时地址，**12 小时后失效**。请及时下载或转存到云存储。
+> 详见 [生图模型文档](https://docs.cloudbase.net/ai/image-model/hy-image-3.5-preview)。
+
+**部署要求**：生图需要 aiProxy **1.2.0+**、`@cloudbase/node-sdk ^3.18.3`（会解析到 `@cloudbase/ai >= 2.32.0`），且云函数超时设为 **900 秒**。从 1.1.0 升级后必须重新部署并让平台重装依赖，否则 `ping` 里不会出现 `imageModels`，插件也不会列出这个模型。
 
 ## 准备工作
 
@@ -56,7 +71,7 @@ tcb fn deploy aiProxy --force
 tcb fn invoke aiProxy --params '{"action":"ping"}'   # 应返回 {"ok":true,...}
 ```
 
-几个要点：普通事件函数（不是 HTTP 函数）、Nodejs18.15 及以上、超时设 120 秒、开云端安装依赖。环境 ID 不用配，运行时会自动注入 `TCB_ENV`；想增减模型就改函数的环境变量 `AI_PROXY_ALLOWED_MODELS`（逗号分隔）。
+几个要点：普通事件函数（不是 HTTP 函数）、Nodejs18.15 及以上、超时设 **900 秒**（生图很慢，4K 更久；文本对话 120 秒够，但两者共用一个函数，取大值）、开云端安装依赖（`@cloudbase/node-sdk ^3.18.3`）。环境 ID 不用配，运行时会自动注入 `TCB_ENV`；想增减模型就改函数的环境变量 `AI_PROXY_ALLOWED_MODELS`（文本）、`AI_PROXY_ALLOWED_IMAGE_MODELS`（生图，逗号分隔）。**从旧版升级务必重新部署并重装依赖**，否则生图模型不可用。
 
 ## 安装和登录
 
@@ -95,7 +110,7 @@ m plugin options cloudbase-bridge '{"gatewayBaseUrl":"http://127.0.0.1:8787"}'
 | 选项 | 作用 | 默认 |
 | --- | --- | --- |
 | `envId` / `region` / `functionName` | 登录信息之外的后备值（纯 OpenCode 环境下登录提问不一定有，可以用它兜底） | — / `cn` / `aiProxy` |
-| `timeoutMs` | 单次调用云函数的最长等待 | 150000 |
+| `timeoutMs` | 文本对话单次调用云函数的最长等待；**生图请求自动放宽到 900 秒** | 150000 |
 | `gatewayBaseUrl` | 测试用的网关地址覆盖 | 不设置 |
 
 ## 出错了怎么办
@@ -104,17 +119,19 @@ m plugin options cloudbase-bridge '{"gatewayBaseUrl":"http://127.0.0.1:8787"}'
 
 ## 已知限制
 
-- 没有真流式：上游是一次性返回，SSE 在本地合成，所以首 token 要等整段生成完；
+- 没有真流式：上游是一次性返回，SSE 在本地合成，所以首 token 要等整段生成完；生图同理，要等整张图生成完才返回；
 - 工具调用需要 aiProxy 1.1.0 及以上——插件从 0.2.4 或更早版本升级后，要重新部署一次云函数（`tcb fn deploy aiProxy --force`）；
-- 不支持图片输入；
-- 特别长的输出可能撞上云函数 120 秒超时；
+- 生图需要 aiProxy 1.2.0+ 与 `@cloudbase/node-sdk ^3.18.3`、云函数超时 900 秒；
+- **文本对话**不支持图片输入（会报 `IMAGE_INPUT_NOT_SUPPORTED`）；**生图模型**支持参考图，但要用 `image_url` 内容块；
+- 生图返回的图片 URL **12 小时后失效**，需及时转存；多轮编辑的 `assembled_history` 目前只在非流式响应的 `image` 结构化字段里提供；
+- 特别长的输出可能撞上云函数超时；生图（尤其 4K）耗时较长，请耐心等待；
 - 没有额度展示（官方没给查询 API）；赠送额度本身有期限（6 个月）。
 
 ## 本地开发
 
 ```bash
 npm install
-npm run check     # 类型检查 + 构建 + 34 个单元测试 + 模拟宿主加载检查，全程不用网络和真实凭证
+npm run check     # 类型检查 + 构建 + 61 个单元测试 + 模拟宿主加载检查，全程不用网络和真实凭证
 ```
 
 发布与收录的步骤见 [`docs/publish-checklist.md`](docs/publish-checklist.md)。

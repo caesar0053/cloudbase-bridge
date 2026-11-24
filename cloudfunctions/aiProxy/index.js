@@ -4,39 +4,58 @@
  * Bridges the CloudBase "小程序成长计划" AI models (which can only be spent
  * from CloudBase SDK channels; direct `/v1/ai/*` HTTP calls are rejected with
  * AI_CHANNEL_NOT_ALLOWED) into an OpenAI Chat Completions compatible JSON
- * reply that the CloudBase Bridge plugin can consume.
+ * reply that the CloudBase Bridge plugin can consume. Text chat and image
+ * generation share one function; `action` selects the channel.
  *
  * Event contract (sent by the plugin as the invocation body):
- *   { action?: "chat" | "ping",       // default "chat"
- *     model: string,                  // e.g. "hy3"
- *     messages: [{ role, content }],  // roles: system | user | assistant | tool
- *                                     // (assistant may carry tool_calls,
- *                                     //  tool carries tool_call_id)
+ *   { action?: "chat" | "image" | "ping",  // default "chat"
+ *     model: string,                  // e.g. "hy3" or "hy-image-v3.5-preview"
+ *     messages: [{ role, content }],  // chat: string/text parts; image: text
+ *                                     // + image_url parts (Chat/Messages)
+ *     // --- chat only ---
  *     temperature?: number,           // 0..2
  *     topP?: number,                  // 0..1
  *     maxTokens?: number,             // positive integer
  *     tools?: [{ type: "function", function: { name, description?, parameters? } }],
- *     toolChoice?: "auto" | "none" | "required" | { type: "function", function: { name } } }
+ *     toolChoice?: "auto" | "none" | "required" | { type: "function", function: { name } },
+ *     // --- image only (hy-image-v3.5-preview) ---
+ *     size?: string,                  // "WxH", 256..8192, area <= 4096x4096
+ *     seed?: number,                  // [0, 2^63-1]
+ *     generate_max_pixels?: number,   // 1048576 | 2359296 | 4194304
+ *     resize_max_pixels?: number,     // default 1048576
+ *     session?: string,               // stable id across multi-turn edits
+ *     footnote?: string,              // watermark, <= 16 chars
+ *     use_search_tool?: { value: boolean } }
  *
  * Reply on success (HTTP 200 body = this return value, per the functions
  * OpenAPI — there is no wrapper envelope):
- *   { id, object: "chat.completion", created, model,
- *     choices: [{ index, message: { role, content, tool_calls? }, finish_reason }],
- *     usage: { prompt_tokens, completion_tokens, total_tokens } }
+ *   - chat:  { id, object: "chat.completion", created, model,
+ *              choices: [{ index, message: { role, content, tool_calls? }, finish_reason }],
+ *              usage: { prompt_tokens, completion_tokens, total_tokens } }
+ *   - image: the CloudBase generateImage result, passed through verbatim
+ *            (object: "image.chat.completion.chunk",
+ *             choices[0].delta.image.{url,width,height,...},
+ *             assembled_history, ...). The plugin reshapes the image URL
+ *            into a Chat Completions message.
  *
  * Reply on failure:
  *   { error: { code, message, requestId? } }
- *   Codes: INVALID_REQUEST, IMAGE_INPUT_NOT_SUPPORTED, MODEL_NOT_ALLOWED,
- *   AI_CHANNEL_NOT_ALLOWED, AI_MODEL_NOT_SUPPORTED, EXCEED_TOKEN_QUOTA_LIMIT,
- *   TCB_ENV_MISSING, UPSTREAM_ERROR — mapped to HTTP statuses by the plugin.
+ *   Codes: INVALID_REQUEST, IMAGE_INPUT_NOT_SUPPORTED, IMAGE_REQUEST_INVALID,
+ *   MODEL_NOT_ALLOWED, AI_CHANNEL_NOT_ALLOWED, AI_MODEL_NOT_SUPPORTED,
+ *   EXCEED_TOKEN_QUOTA_LIMIT, TCB_ENV_MISSING, UPSTREAM_ERROR — mapped to
+ *   HTTP statuses by the plugin.
  *
  * Deployment notes:
  * - Runtime: Node.js (Nodejs18.15 or newer). Dependencies are installed by
  *   the platform from package.json (`installDependency: true`) or shipped in
  *   the upload zip.
+ * - `@cloudbase/node-sdk` >= 3.18.3 (resolves `@cloudbase/ai` >= 2.32.0) is
+ *   REQUIRED for `hy-image-v3.5-preview`. Redeploy with `installDependency`
+ *   after bumping the version so the platform reinstalls the dependency.
  * - The environment id is read from TCB_ENV, which the CloudBase function
  *   runtime injects automatically. No personal environment id is hard-coded.
- * - Set the function timeout to 120 s (AI text generation is slow).
+ * - Set the function timeout to 900 s: image generation (especially 4K) is
+ *   slow and the official docs recommend 900 s. 120 s is not enough.
  * - Never put an API Key in this function: the model channel is
  *   authenticated by the environment itself.
  */
@@ -60,14 +79,25 @@ const DEFAULT_ALLOWED_MODELS = [
   "deepseek-v4.1-flash-1017",
 ];
 
+/** Image-generation models. `hy-image-v3.5-preview` uses the Chat/Messages
+ * protocol (createImageModel + generateImage), not generateText, so it gets
+ * its own allowlist and code path. Override with AI_PROXY_ALLOWED_IMAGE_MODELS
+ * (comma-separated). Docs: https://docs.cloudbase.net/ai/image-model/node-sdk */
+const DEFAULT_ALLOWED_IMAGE_MODELS = ["hy-image-v3.5-preview"];
+
 const MAX_MESSAGES = 128;
 const MAX_SINGLE_MESSAGE_CHARS = 200_000;
 const MAX_TOTAL_MESSAGE_CHARS = 400_000;
+const MAX_IMAGE_MESSAGES = 64;
+const MAX_IMAGE_SINGLE_MESSAGE_CHARS = 2_000_000; // base64 reference images can be large; single image <= 20 MB
+const MAX_IMAGE_TOTAL_MESSAGE_CHARS = 8_000_000;
 const MAX_MODEL_ID_LENGTH = 64;
 const MAX_TOOLS = 128;
 const MAX_TOOL_CALLS_PER_MESSAGE = 64;
 const MAX_TOOL_NAME_LENGTH = 128;
-const AI_PROXY_VERSION = "1.1.0";
+const MAX_FOOTNOTE_LENGTH = 16;
+const MAX_SESSION_LENGTH = 128;
+const AI_PROXY_VERSION = "1.2.0";
 
 /** Group name for the managed model pool — required by the official
  * growth-plan notice ("createModel 的参数改为 cloudbase"). The concrete
@@ -115,6 +145,202 @@ function allowedModels() {
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
   return parsed.length > 0 ? parsed : DEFAULT_ALLOWED_MODELS.slice();
+}
+
+function allowedImageModels() {
+  const raw = process.env.AI_PROXY_ALLOWED_IMAGE_MODELS;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return DEFAULT_ALLOWED_IMAGE_MODELS.slice();
+  }
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return parsed.length > 0 ? parsed : DEFAULT_ALLOWED_IMAGE_MODELS.slice();
+}
+
+/* ------------------------------------------------------------------ *
+ * Image request validation (pure functions, unit-tested via _internal).*
+ * ------------------------------------------------------------------ */
+
+/**
+ * Normalize one image message's `content` to the Chat/Messages array shape
+ * the hy-image model expects: [{ type: "text", text }, { type: "image_url",
+ * image_url: { url } }]. A plain string becomes a single text part; an
+ * OpenAI multimodal array keeps only text/image_url parts (base64 data URLs
+ * and public URLs are both valid). Returns { content, chars } or { error }.
+ */
+function normalizeImageContent(content, index) {
+  if (typeof content === "string") {
+    return { content: [{ type: "text", text: content }], chars: content.length };
+  }
+  if (content === null || content === undefined) {
+    // assistant messages that only trigger a tool call may omit content.
+    return { content: [], chars: 0 };
+  }
+  if (!Array.isArray(content)) {
+    return errorEnvelope(
+        "IMAGE_REQUEST_INVALID",
+        `messages[${index}].content must be a string or an array of text/image_url parts (image action).`,
+      );
+  }
+  const parts = [];
+  let chars = 0;
+  for (let partIndex = 0; partIndex < content.length; partIndex += 1) {
+    const part = content[partIndex];
+    if (!isPlainObject(part)) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", `messages[${index}].content[${partIndex}] must be an object.`);
+    }
+    if (part.type === "text" && typeof part.text === "string") {
+      parts.push({ type: "text", text: part.text });
+      chars += part.text.length;
+      continue;
+    }
+    if (part.type === "image_url" && isPlainObject(part.image_url) && typeof part.image_url.url === "string" && part.image_url.url.length > 0) {
+      parts.push({ type: "image_url", image_url: { url: part.image_url.url } });
+      chars += part.image_url.url.length;
+      continue;
+    }
+    const partType = typeof part.type === "string" ? part.type.slice(0, 24) : "unknown";
+    return errorEnvelope(
+        "IMAGE_REQUEST_INVALID",
+        `messages[${index}].content[${partIndex}] has unsupported type "${partType}". Image action accepts only text and image_url parts.`,
+      );
+  }
+  return { content: parts, chars };
+}
+
+/** All roles the image Chat/Messages protocol documents, plus `system` for
+ * tolerance (the server takes the last role=user message as the prompt). */
+const IMAGE_ALLOWED_ROLES = new Set(["system", "user", "assistant", "tool"]);
+
+/**
+ * Normalize one image message, keeping the fields needed to replay
+ * `assembled_history` in multi-turn edits (reasoning, tool_calls,
+ * tool_call_id). Returns { message, chars } or { error }.
+ */
+function normalizeImageMessage(message, index) {
+  if (!isPlainObject(message)) {
+    return errorEnvelope("IMAGE_REQUEST_INVALID", `messages[${index}] must be an object.`);
+  }
+  const role = typeof message.role === "string" ? message.role : "";
+  if (!IMAGE_ALLOWED_ROLES.has(role)) {
+    return errorEnvelope(
+        "IMAGE_REQUEST_INVALID",
+        `messages[${index}].role "${role.slice(0, 24)}" is not supported. Image action accepts: system, user, assistant, tool.`,
+      );
+  }
+  const normalizedContent = normalizeImageContent(message.content, index);
+  if (normalizedContent.error) return { error: normalizedContent.error };
+  const normalized = { role, content: normalizedContent.content };
+  let chars = normalizedContent.chars;
+  // Keep multi-turn edit fields verbatim (assembled_history replay).
+  if (typeof message.reasoning === "string") {
+    normalized.reasoning = message.reasoning;
+    chars += message.reasoning.length;
+  }
+  if (Array.isArray(message.tool_calls)) {
+    normalized.tool_calls = message.tool_calls;
+    chars += JSON.stringify(message.tool_calls).length;
+  }
+  if (typeof message.tool_call_id === "string" && message.tool_call_id.length > 0) {
+    normalized.tool_call_id = message.tool_call_id;
+  }
+  if (chars > MAX_IMAGE_SINGLE_MESSAGE_CHARS) {
+    return errorEnvelope(
+        "IMAGE_REQUEST_INVALID",
+        `messages[${index}] is too large (${chars} chars; limit ${MAX_IMAGE_SINGLE_MESSAGE_CHARS}).`,
+      );
+  }
+  return { message: normalized, chars };
+}
+
+/**
+ * Validate and normalize the "image" event. Returns { params } or { error }.
+ * `params` is the object passed straight to `imageModel.generateImage()`.
+ */
+function validateImageEvent(event) {
+  if (!isPlainObject(event)) {
+    return errorEnvelope("IMAGE_REQUEST_INVALID", "Event must be a JSON object.");
+  }
+  const model = typeof event.model === "string" ? event.model.trim() : "";
+  if (model.length === 0 || model.length > MAX_MODEL_ID_LENGTH || !/^[A-Za-z0-9._-]+$/.test(model)) {
+    return errorEnvelope("IMAGE_REQUEST_INVALID", "event.model must be a non-empty model id (letters, digits, . _ -).");
+  }
+  const allowList = allowedImageModels();
+  if (!allowList.includes(model)) {
+    return errorEnvelope(
+        "MODEL_NOT_ALLOWED",
+        `Image model "${model}" is not in the aiProxy image allowlist. Allowed: ${allowList.join(", ")}. Adjust AI_PROXY_ALLOWED_IMAGE_MODELS if your environment supports more.`,
+      );
+  }
+  if (!Array.isArray(event.messages) || event.messages.length === 0) {
+    return errorEnvelope("IMAGE_REQUEST_INVALID", "event.messages must be a non-empty array.");
+  }
+  if (event.messages.length > MAX_IMAGE_MESSAGES) {
+    return errorEnvelope("IMAGE_REQUEST_INVALID", `Too many messages (${event.messages.length}; limit ${MAX_IMAGE_MESSAGES}).`);
+  }
+
+  const messages = [];
+  let totalChars = 0;
+  for (let index = 0; index < event.messages.length; index += 1) {
+    const result = normalizeImageMessage(event.messages[index], index);
+    if (result.error) return { error: result.error };
+    totalChars += result.chars;
+    if (totalChars > MAX_IMAGE_TOTAL_MESSAGE_CHARS) {
+      return errorEnvelope(
+          "IMAGE_REQUEST_INVALID",
+          `Conversation too large (${totalChars} chars; limit ${MAX_IMAGE_TOTAL_MESSAGE_CHARS}). Trim reference images.`,
+        );
+    }
+    messages.push(result.message);
+  }
+
+  const params = { model, messages };
+  // size: "WxH", each side 256..8192, area <= 4096*4096.
+  if (event.size !== undefined && event.size !== null) {
+    if (typeof event.size !== "string" || !/^\d+x\d+$/i.test(event.size)) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", 'event.size must look like "1024x1024".');
+    }
+    const [w, h] = event.size.toLowerCase().split("x").map(Number);
+    if (w < 256 || h < 256 || w > 8192 || h > 8192 || w * h > 4096 * 4096) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", "event.size sides must be within [256, 8192] and area <= 4096x4096.");
+    }
+    params.size = `${w}x${h}`;
+  }
+  if (event.seed !== undefined && event.seed !== null) {
+    if (!Number.isInteger(event.seed) || event.seed < 0 || event.seed > Number.MAX_SAFE_INTEGER) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", "event.seed must be a non-negative integer.");
+    }
+    params.seed = event.seed;
+  }
+  for (const key of ["generate_max_pixels", "resize_max_pixels"]) {
+    if (event[key] !== undefined && event[key] !== null) {
+      if (!Number.isInteger(event[key]) || event[key] <= 0) {
+        return errorEnvelope("IMAGE_REQUEST_INVALID", `event.${key} must be a positive integer.`);
+      }
+      params[key] = event[key];
+    }
+  }
+  if (event.session !== undefined && event.session !== null) {
+    if (typeof event.session !== "string" || event.session.length === 0 || event.session.length > MAX_SESSION_LENGTH) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", `event.session must be a non-empty string up to ${MAX_SESSION_LENGTH} chars.`);
+    }
+    params.session = event.session;
+  }
+  if (event.footnote !== undefined && event.footnote !== null) {
+    if (typeof event.footnote !== "string" || event.footnote.length > MAX_FOOTNOTE_LENGTH) {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", `event.footnote must be a string up to ${MAX_FOOTNOTE_LENGTH} chars.`);
+    }
+    params.footnote = event.footnote;
+  }
+  if (event.use_search_tool !== undefined && event.use_search_tool !== null) {
+    if (!isPlainObject(event.use_search_tool) || typeof event.use_search_tool.value !== "boolean") {
+      return errorEnvelope("IMAGE_REQUEST_INVALID", "event.use_search_tool must look like { value: boolean }.");
+    }
+    params.use_search_tool = { value: event.use_search_tool.value };
+  }
+  return { params };
 }
 
 /* ------------------------------------------------------------------ *
@@ -455,6 +681,7 @@ function pingResult() {
     version: AI_PROXY_VERSION,
     env: process.env.TCB_ENV || null,
     models: allowedModels(),
+    imageModels: allowedImageModels(),
     timestamp: new Date().toISOString(),
   };
 }
@@ -527,6 +754,73 @@ function getChatModel() {
   return chatModel;
 }
 
+let imageModel = null;
+
+function getImageModel() {
+  if (imageModel) return imageModel;
+  const ai = getApp().ai();
+  // hy-image-v3.5-preview uses the managed "cloudbase" image provider
+  // (createImageModel), NOT createModel/generateText. See
+  // https://docs.cloudbase.net/ai/image-model/node-sdk
+  imageModel = ai.createImageModel(AI_MODEL_GROUP);
+  return imageModel;
+}
+
+/**
+ * Map validated image params to the generateImage input. Kept as a pure
+ * function so tests can lock the shape. Every field has already been
+ * validated by validateImageEvent, so this is a straight copy.
+ */
+function buildImageGenerateInput(params) {
+  const input = { model: params.model, messages: params.messages };
+  for (const key of ["size", "seed", "generate_max_pixels", "resize_max_pixels", "session", "footnote", "use_search_tool"]) {
+    if (params[key] !== undefined && params[key] !== null) input[key] = params[key];
+  }
+  return input;
+}
+
+/**
+ * Perform the image model call with @cloudbase/node-sdk. The result is
+ * passed through VERBATIM (the plugin reshapes it): it carries
+ * choices[0].delta.image, assembled_history, request_id, usage, etc.
+ * Tests can inject a fake via `exports._callImageModelOverride`, which
+ * replaces only the SDK call and returns a raw generateImage result; the
+ * validation below then applies to both real and injected results.
+ */
+async function callImageModel(params, requestId) {
+  let result;
+  try {
+    result = typeof exports._callImageModelOverride === "function"
+      ? await exports._callImageModelOverride(params, requestId)
+      : await getImageModel().generateImage(buildImageGenerateInput(params));
+  } catch (err) {
+    const code = pickUpstreamCode(err);
+    if (code) {
+      return errorEnvelope(code, safeErrorMessage(err), requestId);
+    }
+    return errorEnvelope("UPSTREAM_ERROR", safeErrorMessage(err), requestId);
+  }
+  if (!result || typeof result !== "object") {
+    return errorEnvelope("UPSTREAM_ERROR", "The image model returned an empty result.", requestId);
+  }
+  if (result.error) {
+    const code = pickUpstreamCode(result.error) || "UPSTREAM_ERROR";
+    return errorEnvelope(code, safeErrorMessage(result.error), requestId);
+  }
+  // The docs say success is determined by choices[0].delta.image, not by
+  // finish_reason. Guard against a structurally-empty success response.
+  const choice = Array.isArray(result.choices) ? result.choices[0] : null;
+  const image = isPlainObject(choice) && isPlainObject(choice.delta) ? choice.delta.image : null;
+  if (!isPlainObject(image) || typeof image.url !== "string" || image.url.length === 0) {
+    return errorEnvelope(
+        "UPSTREAM_ERROR",
+        "The image model reply has no choices[0].delta.image.url. Check the function logs and the model's availability.",
+        requestId,
+      );
+  }
+  return { imageResult: result };
+}
+
 /**
  * Perform the model call with @cloudbase/node-sdk. Tests can inject a fake
  * via `exports._callModelOverride` (never used in production deployments).
@@ -563,19 +857,33 @@ exports.main = async (event, context) => {
         undefined
       : undefined;
   try {
-    const action = isPlainObject(event) && event.action === "ping" ? "ping" : "chat";
+    const action = isPlainObject(event) && typeof event.action === "string" ? event.action : "chat";
     if (action === "ping") {
       return pingResult();
     }
-    const validated = validateChatEvent(event);
-    if (validated.error) {
-      return { error: validated.error };
+    if (action === "image") {
+      const validated = validateImageEvent(event);
+      if (validated.error) {
+        return { error: validated.error };
+      }
+      const outcome = await callImageModel(validated.params, requestId);
+      if (outcome.error) {
+        return { error: outcome.error };
+      }
+      return outcome.imageResult;
     }
-    const outcome = await callModel(validated.params, requestId);
-    if (outcome.error) {
-      return { error: outcome.error };
+    if (action === "chat") {
+      const validated = validateChatEvent(event);
+      if (validated.error) {
+        return { error: validated.error };
+      }
+      const outcome = await callModel(validated.params, requestId);
+      if (outcome.error) {
+        return { error: outcome.error };
+      }
+      return outcome.completion;
     }
-    return outcome.completion;
+    return errorEnvelope("INVALID_REQUEST", `Unknown action "${action}". Expected chat, image or ping.`);
   } catch (err) {
     const code = pickUpstreamCode(err) || (err && err.code) || "UPSTREAM_ERROR";
     return errorEnvelope(code, safeErrorMessage(err), requestId);
@@ -590,10 +898,15 @@ exports._internal = {
   AI_PROXY_VERSION,
   AI_MODEL_GROUP,
   DEFAULT_ALLOWED_MODELS,
+  DEFAULT_ALLOWED_IMAGE_MODELS,
   MAX_MESSAGES,
   MAX_SINGLE_MESSAGE_CHARS,
   MAX_TOTAL_MESSAGE_CHARS,
+  MAX_IMAGE_MESSAGES,
+  MAX_IMAGE_SINGLE_MESSAGE_CHARS,
+  MAX_IMAGE_TOTAL_MESSAGE_CHARS,
   allowedModels,
+  allowedImageModels,
   validateChatEvent,
   normalizeMessage,
   normalizeTools,
@@ -601,6 +914,10 @@ exports._internal = {
   buildGenerateInput,
   buildChatCompletion,
   normalizeUsage,
+  normalizeImageContent,
+  normalizeImageMessage,
+  validateImageEvent,
+  buildImageGenerateInput,
   errorEnvelope,
   pingResult,
   safeErrorMessage,

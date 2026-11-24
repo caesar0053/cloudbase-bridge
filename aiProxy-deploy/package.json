@@ -1,0 +1,10 @@
+{
+  "name": "aiProxy",
+  "version": "1.2.0",
+  "description": "CloudBase Event Function that proxies CloudBase AI text (generateText) and image (generateImage) models as an OpenAI-compatible reply for the CloudBase Bridge plugin",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.18.3"
+  }
+}

@@ -359,3 +359,225 @@ test("safeErrorMessage bounds length and handles primitives", () => {
   assert.deepEqual(_internal.safeErrorMessage(undefined), "(no message)");
   assert.ok(_internal.safeErrorMessage("x".repeat(500)).length <= 301);
 });
+
+/* ---------------- image action ---------------- */
+
+const IMAGE_MODEL = "hy-image-v3.5-preview";
+
+function imageResult(overrides = {}) {
+  return {
+    id: "trace-img-1",
+    object: "image.chat.completion.chunk",
+    created: 1_762_700_000,
+    model: "internal-hy-image",
+    round: 0,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          type: "image",
+          image: {
+            url: "https://example.com/generated.png",
+            width: 1024,
+            height: 1024,
+            source: "generated",
+            tool_call_id: "call_img_1",
+          },
+        },
+        finish_reason: null,
+      },
+    ],
+    usage: { total_tokens: 20 },
+    request_id: "req-img-1",
+    assembled_history: [{ role: "tool", tool_call_id: "call_img_1", content: [] }],
+    ...overrides,
+  };
+}
+
+test("default image allowlist includes hy-image-v3.5-preview", () => {
+  assert.ok(_internal.DEFAULT_ALLOWED_IMAGE_MODELS.includes(IMAGE_MODEL));
+  assert.deepEqual(_internal.allowedImageModels(), [IMAGE_MODEL]);
+});
+
+test("validateImageEvent turns a plain string prompt into a text part", () => {
+  const result = _internal.validateImageEvent({
+    action: "image",
+    model: IMAGE_MODEL,
+    messages: [{ role: "user", content: "画一只在沙滩上奔跑的金毛犬" }],
+  });
+  assert(!result.error, JSON.stringify(result.error));
+  assert.deepEqual(result.params.model, IMAGE_MODEL);
+  assert.deepEqual(result.params.messages, [
+    { role: "user", content: [{ type: "text", text: "画一只在沙滩上奔跑的金毛犬" }] },
+  ]);
+});
+
+test("validateImageEvent forwards reference images and every documented option", () => {
+  const result = _internal.validateImageEvent({
+    model: IMAGE_MODEL,
+    size: "4096x4096",
+    seed: 42,
+    generate_max_pixels: 4_194_304,
+    resize_max_pixels: 1_048_576,
+    session: "demo-session-001",
+    footnote: "by-bridge",
+    use_search_tool: { value: true },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "参考这张图的风格，画一只猫" },
+          { type: "image_url", image_url: { url: "https://example.com/dog.png" } },
+        ],
+      },
+    ],
+  });
+  assert(!result.error, JSON.stringify(result.error));
+  assert.deepEqual(result.params.messages[0].content, [
+    { type: "text", text: "参考这张图的风格，画一只猫" },
+    { type: "image_url", image_url: { url: "https://example.com/dog.png" } },
+  ]);
+  assert.equal(result.params.size, "4096x4096");
+  assert.equal(result.params.seed, 42);
+  assert.equal(result.params.generate_max_pixels, 4_194_304);
+  assert.equal(result.params.resize_max_pixels, 1_048_576);
+  assert.equal(result.params.session, "demo-session-001");
+  assert.equal(result.params.footnote, "by-bridge");
+  assert.deepEqual(result.params.use_search_tool, { value: true });
+});
+
+test("validateImageEvent keeps assembled_history replay fields", () => {
+  const result = _internal.validateImageEvent({
+    model: IMAGE_MODEL,
+    messages: [
+      { role: "assistant", content: null, reasoning: "chain", tool_calls: [{ id: "c1", type: "function", function: { name: "gen", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAA" } }] },
+      { role: "user", content: "把它换成布偶猫" },
+    ],
+  });
+  assert(!result.error, JSON.stringify(result.error));
+  assert.equal(result.params.messages[0].reasoning, "chain");
+  assert.equal(result.params.messages[0].tool_calls.length, 1);
+  assert.equal(result.params.messages[1].tool_call_id, "c1");
+  assert.deepEqual(result.params.messages[1].content, [{ type: "image_url", image_url: { url: "data:image/png;base64,AAA" } }]);
+});
+
+test("validateImageEvent rejects bad models, sizes, parts and options", () => {
+  const base = { model: IMAGE_MODEL, messages: [{ role: "user", content: "hi" }] };
+  const cases = [
+    [{ model: "hy3" }, "MODEL_NOT_ALLOWED"],
+    [{ model: "not a model" }, "IMAGE_REQUEST_INVALID"],
+    [{ size: "1024" }, "IMAGE_REQUEST_INVALID"],
+    [{ size: "128x128" }, "IMAGE_REQUEST_INVALID"],
+    [{ size: "8192x8192" }, "IMAGE_REQUEST_INVALID"],
+    [{ seed: -1 }, "IMAGE_REQUEST_INVALID"],
+    [{ footnote: "x".repeat(17) }, "IMAGE_REQUEST_INVALID"],
+    [{ session: "" }, "IMAGE_REQUEST_INVALID"],
+    [{ use_search_tool: { value: "yes" } }, "IMAGE_REQUEST_INVALID"],
+    [{ messages: [] }, "IMAGE_REQUEST_INVALID"],
+    [{ messages: [{ role: "user", content: [{ type: "audio", text: "x" }] }] }, "IMAGE_REQUEST_INVALID"],
+    [{ messages: [{ role: "function", content: "x" }] }, "IMAGE_REQUEST_INVALID"],
+  ];
+  for (const [extra, expectedCode] of cases) {
+    const result = _internal.validateImageEvent({ ...base, ...extra });
+    assert(result.error, `expected rejection for ${JSON.stringify(extra)}`);
+    assert.equal(result.error.code, expectedCode, JSON.stringify(extra));
+  }
+});
+
+test("buildImageGenerateInput forwards only validated options", () => {
+  const input = _internal.buildImageGenerateInput({
+    model: IMAGE_MODEL,
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    size: "1024x1024",
+    seed: 7,
+    session: "s1",
+  });
+  assert.deepEqual(input, {
+    model: IMAGE_MODEL,
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    size: "1024x1024",
+    seed: 7,
+    session: "s1",
+  });
+  assert.equal("temperature" in input, false);
+});
+
+function withInjectedCallImageModel(fake) {
+  const original = aiProxy._callImageModelOverride;
+  aiProxy._callImageModelOverride = fake;
+  return () => {
+    aiProxy._callImageModelOverride = original;
+  };
+}
+
+test("exports.main image passes the generateImage result through verbatim", async () => {
+  const seen = [];
+  const restore = withInjectedCallImageModel(async (params, requestId) => {
+    seen.push({ params, requestId });
+    return imageResult(); // a raw generateImage result, like the SDK returns
+  });
+  try {
+    const reply = await aiProxy.main(
+      { action: "image", model: IMAGE_MODEL, size: "1024x1024", messages: [{ role: "user", content: "一只橘猫" }] },
+      { request_id: "rid-img" },
+    );
+    assert.equal(reply.object, "image.chat.completion.chunk");
+    assert.equal(reply.choices[0].delta.image.url, "https://example.com/generated.png");
+    assert.ok(Array.isArray(reply.assembled_history), "multi-turn history must survive");
+    assert.equal(reply.request_id, "req-img-1");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].params.size, "1024x1024");
+    assert.equal(seen[0].requestId, "rid-img");
+  } finally {
+    restore();
+  }
+});
+
+test("callImageModel surfaces upstream error and empty-image replies", async () => {
+  const upstream = withInjectedCallImageModel(async () => ({
+    error: { code: "AI_MODEL_NOT_SUPPORTED", message: "image model not enabled" },
+  }));
+  try {
+    const reply = await aiProxy.main({ action: "image", model: IMAGE_MODEL, messages: [{ role: "user", content: "hi" }] });
+    assert.equal(reply.error.code, "AI_MODEL_NOT_SUPPORTED");
+    assert.match(reply.error.message, /not enabled/);
+  } finally {
+    upstream();
+  }
+
+  const empty = withInjectedCallImageModel(async () => ({ choices: [{ delta: {} }] }));
+  try {
+    const reply = await aiProxy.main({ action: "image", model: IMAGE_MODEL, messages: [{ role: "user", content: "hi" }] });
+    assert.equal(reply.error.code, "UPSTREAM_ERROR");
+    assert.match(reply.error.message, /delta.image.url/);
+  } finally {
+    empty();
+  }
+
+  const thrown = withInjectedCallImageModel(async () => {
+    const err = new Error("content safety blocked");
+    err.code = "CONTENT_SAFETY";
+    throw err;
+  });
+  try {
+    const reply = await aiProxy.main({ action: "image", model: IMAGE_MODEL, messages: [{ role: "user", content: "hi" }] });
+    assert.equal(reply.error.code, "CONTENT_SAFETY");
+  } finally {
+    thrown();
+  }
+});
+
+test("exports.main ping reports both text and image model lists", async () => {
+  const reply = await aiProxy.main({ action: "ping" }, {});
+  assert.deepEqual(reply.ok, true);
+  assert.ok(reply.models.includes("hy3"));
+  assert.ok(reply.imageModels.includes(IMAGE_MODEL));
+  assert.equal(reply.version, "1.2.0");
+});
+
+test("exports.main rejects an unknown action", async () => {
+  const reply = await aiProxy.main({ action: "translate", model: "hy3", messages: [{ role: "user", content: "hi" }] }, {});
+  assert.equal(reply.error.code, "INVALID_REQUEST");
+  assert.match(reply.error.message, /Unknown action/);
+});

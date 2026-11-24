@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-11-24
+
+- **Image generation**: `hy-image-v3.5-preview` (the growth-plan image
+  model) is now a first-class provider model. It uses the Chat/Messages
+  protocol via `createImageModel("cloudbase").generateImage`, a different SDK
+  channel from text chat, so the bridge routes it with `event.action = "image"`.
+  aiProxy passes the CloudBase image result through verbatim; the plugin
+  reshapes `choices[0].delta.image` into a Chat Completions message (markdown
+  image + a structured `image` field with url/width/height/
+  `assembled_history`/`request_id`), reusing the existing JSON and SSE paths.
+- Image requests support the documented options: `size` (incl. 4K), `seed`,
+  `generate_max_pixels`, `resize_max_pixels`, `session`, `footnote`,
+  `use_search_tool`, plus `image_url` reference images and multi-turn
+  `assembled_history` replay. They get a **900 s** timeout and an **8 MiB**
+  event ceiling (vs 150 s / 512 KiB for text chat).
+- **aiProxy 1.2.0**: new `action: "image"` branch with its own allowlist
+  (`AI_PROXY_ALLOWED_IMAGE_MODELS`), strict validation and error code
+  `IMAGE_REQUEST_INVALID`; `ping` now reports `imageModels`. Requires
+  `@cloudbase/node-sdk ^3.18.3` (resolves `@cloudbase/ai >= 2.32.0`) and a
+  **900 s** function timeout — see the docs. **Redeploy the function and
+  reinstall dependencies**; older functions cannot serve image requests and
+  won't list the image model.
+- `provider.models` merges both `models` and `imageModels` from ping;
+  the image model is registered with `tool_call: false`.
+- Tests: 20 new unit/load-check cases for image validation, routing,
+  reshaping, allowlists, payload ceiling and error mapping (61 total);
+  the mock gateway and `check-plugin.mjs` now exercise the image channel.
+
 ## [0.2.5] - 2026-11-24
 
 - Tool calling: the plugin now forwards `tools`, `tool_choice` and

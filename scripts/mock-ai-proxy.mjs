@@ -74,9 +74,10 @@ const server = createServer((req, res) => {
         JSON.stringify({
           ok: true,
           service: "aiProxy",
-          version: "1.1.0",
+          version: "1.2.0",
           env: "mock-env",
           models: ["hy3", "hy4", "hy4-preview", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"],
+          imageModels: ["hy-image-v3.5-preview"],
         }),
       );
       return;
@@ -86,6 +87,38 @@ const server = createServer((req, res) => {
       res.end(
         JSON.stringify({
           error: { code: "INVALID_REQUEST", message: "mock: event must carry model + messages" },
+        }),
+      );
+      return;
+    }
+    if (event.action === "image") {
+      // Mirror the CloudBase generateImage result shape (passed through by
+      // aiProxy so the plugin can reshape it into a Chat Completions image).
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "trace-mock-img",
+          object: "image.chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: event.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                image: {
+                  url: "https://example.com/mock-generated.png",
+                  width: 1024,
+                  height: 1024,
+                  source: "generated",
+                  tool_call_id: "call_mock_img",
+                },
+              },
+              finish_reason: null,
+            },
+          ],
+          usage: { total_tokens: 12 },
+          request_id: "mock-img-req",
+          assembled_history: [],
         }),
       );
       return;
@@ -114,4 +147,5 @@ server.listen(port, "127.0.0.1", () => {
   console.log("Try:");
   console.log(`  curl -s http://127.0.0.1:${port}/v1/functions/aiProxy -H 'authorization: Bearer test' -H 'content-type: application/json' -d '{"action":"ping"}'`);
   console.log(`  curl -s http://127.0.0.1:${port}/v1/functions/aiProxy -H 'authorization: Bearer test' -H 'content-type: application/json' -d '{"model":"hy3","messages":[{"role":"user","content":"hi"}]}'`);
+  console.log(`  curl -s http://127.0.0.1:${port}/v1/functions/aiProxy -H 'authorization: Bearer test' -H 'content-type: application/json' -d '{"action":"image","model":"hy-image-v3.5-preview","messages":[{"role":"user","content":"一只橘猫"}]}'`);
 });
