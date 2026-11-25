@@ -142,20 +142,71 @@ test("buildGenerateInput forwards max_tokens and tools in a single model step", 
   assert.deepEqual(withTools.maxSteps, 1, "the SDK must not execute the agent's tools itself");
 });
 
-test("validateChatEvent rejects image parts with IMAGE_INPUT_NOT_SUPPORTED", () => {
+test("validateChatEvent forwards image_url parts for vision-capable models", () => {
+  const content = [
+    { type: "text", text: "what is this?" },
+    { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+  ];
+  for (const model of ["hy4", "hy4-flash", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"]) {
+    const result = _internal.validateChatEvent({ model, messages: [{ role: "user", content }] });
+    assert(!result.error, `${model} should accept image_url parts`);
+    assert.deepEqual(result.params.messages, [{ role: "user", content }]);
+  }
+});
+
+test("validateChatEvent rejects image parts for text-only models", () => {
+  for (const model of ["hy3", "hy4-preview"]) {
+    const result = _internal.validateChatEvent({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+          ],
+        },
+      ],
+    });
+    assert.equal(result.error.code, "IMAGE_INPUT_NOT_SUPPORTED");
+    assert.match(result.error.message, new RegExp(model));
+  }
+});
+
+test("validateChatEvent rejects video_url/file parts even for vision models", () => {
   const result = _internal.validateChatEvent({
-    model: "deepseek-v4.1-flash",
+    model: "hy4",
     messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "what is this?" },
-          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
-        ],
-      },
+      { role: "user", content: [{ type: "video_url", video_url: { url: "https://example.com/a.mp4" } }] },
     ],
   });
-  assert.deepEqual(result.error.code, "IMAGE_INPUT_NOT_SUPPORTED");
+  assert.equal(result.error.code, "IMAGE_INPUT_NOT_SUPPORTED");
+});
+
+test("vision chat accepts base64 data URLs beyond the plain-text char limit", () => {
+  const dataUrl = "data:image/png;base64," + "A".repeat(300_000);
+  const result = _internal.validateChatEvent({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }],
+  });
+  assert(!result.error, "a 300k-char base64 image must fit the vision ceiling");
+  assert.equal(result.params.messages[0].content[0].image_url.url, dataUrl);
+});
+
+test("AI_PROXY_VISION_MODELS overrides the vision allowlist", () => {
+  const prev = process.env.AI_PROXY_VISION_MODELS;
+  process.env.AI_PROXY_VISION_MODELS = "hy3";
+  try {
+    assert.deepEqual(_internal.visionModels(), ["hy3"]);
+    const result = _internal.validateChatEvent({
+      model: "hy3",
+      messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/cat.png" } }] }],
+    });
+    assert(!result.error);
+  } finally {
+    if (prev === undefined) delete process.env.AI_PROXY_VISION_MODELS;
+    else process.env.AI_PROXY_VISION_MODELS = prev;
+  }
 });
 
 test("validateChatEvent flattens text array parts", () => {

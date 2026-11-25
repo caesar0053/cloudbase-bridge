@@ -28,9 +28,19 @@ All notable changes to this project are documented here. The format follows
   won't list the image model.
 - `provider.models` merges both `models` and `imageModels` from ping;
   the image model is registered with `tool_call: false`.
+- **Vision chat**: text models that accept images now receive `image_url`
+  content parts instead of being rejected wholesale. Per the CloudBase
+  capability matrix, `hy4`, `hy4-flash`, `deepseek-v4.1-flash` and
+  `deepseek-v4.1-flash-1017` are vision-capable (图片 ✅); `hy3` is ❌ and
+  `hy4-preview` is not listed as a vision model. `IMAGE_INPUT_NOT_SUPPORTED`
+  now means "this model / this content type", not "the chat channel".
+  Override the set with `AI_PROXY_VISION_MODELS`; vision chat requests get
+  the 8 MiB event ceiling so base64 images are not rejected by the 512 KiB
+  text limit. Video/file parts are still not forwarded.
 - Tests: 20 new unit/load-check cases for image validation, routing,
-  reshaping, allowlists, payload ceiling and error mapping (61 total);
-  the mock gateway and `check-plugin.mjs` now exercise the image channel.
+  reshaping, allowlists, payload ceiling and error mapping, plus 6 for
+  vision chat gating and payload ceilings (67 total); the mock gateway and
+  `check-plugin.mjs` now exercise the image channel.
 
 ## [0.2.5] - 2026-11-24
 

@@ -295,6 +295,24 @@ function mapFunctionError(err, requestId) {
  * Chat Completions <-> aiProxy adapters.                             *
  * ------------------------------------------------------------------ */
 /**
+ * True when any message carries an OpenAI `image_url` content part. Vision
+ * chat requests need the same generous event ceiling as image-generation
+ * requests, because base64 data URLs are far larger than plain text.
+ */
+function hasImageParts(messages) {
+    if (!Array.isArray(messages))
+        return false;
+    for (const message of messages) {
+        if (!isPlainObject(message) || !Array.isArray(message.content))
+            continue;
+        for (const part of message.content) {
+            if (isPlainObject(part) && part.type === "image_url")
+                return true;
+        }
+    }
+    return false;
+}
+/**
  * Build the aiProxy invocation event. Text models use action "chat";
  * image models use action "image" and carry the image-model extras straight
  * through (the cloud function validates them before calling generateImage).
@@ -606,11 +624,13 @@ async function bridgeFetch(input, init) {
     const payload = JSON.stringify(event);
     // Measure real UTF-8 bytes: string .length counts UTF-16 code units and
     // under-reports CJK content (each CJK char is typically 3 bytes but 1-2 units).
-    // Image events get a larger ceiling because base64 reference images are big.
+    // Image-generation events AND vision chat events (image_url content parts)
+    // get a larger ceiling because base64 reference images are big.
     const payloadBytes = new TextEncoder().encode(payload).byteLength;
-    const maxEventBytes = imageRequest ? IMAGE_MAX_EVENT_BYTES : DEFAULT_MAX_EVENT_BYTES;
+    const largePayload = imageRequest || hasImageParts(body.messages);
+    const maxEventBytes = largePayload ? IMAGE_MAX_EVENT_BYTES : DEFAULT_MAX_EVENT_BYTES;
     if (payloadBytes > maxEventBytes) {
-        const hint = imageRequest ? "Use a public image URL instead of a large base64 reference." : "Trim the history and retry.";
+        const hint = largePayload ? "Use a public image URL instead of a large base64 reference." : "Trim the history and retry.";
         return errorResponse(413, `Conversation payload too large (${payloadBytes} bytes; limit ${maxEventBytes} bytes). ${hint}`, { code: "PAYLOAD_TOO_LARGE" });
     }
     log("debug", `invoke ${cfg.functionName} action=${imageRequest ? "image" : "chat"} model=${model} stream=${stream} bytes=${payloadBytes}`);
@@ -888,6 +908,7 @@ export const _internal = {
     MODEL_CATALOG,
     IMAGE_MODEL_CATALOG,
     isImageModel,
+    hasImageParts,
     isValidEnvId,
     isValidFunctionName,
     gatewayBase,

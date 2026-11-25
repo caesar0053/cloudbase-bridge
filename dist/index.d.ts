@@ -196,6 +196,12 @@ declare function mapGatewayError(status: number, body: {
  */
 declare function mapFunctionError(err: Json, requestId?: string): Response;
 /**
+ * True when any message carries an OpenAI `image_url` content part. Vision
+ * chat requests need the same generous event ceiling as image-generation
+ * requests, because base64 data URLs are far larger than plain text.
+ */
+declare function hasImageParts(messages: unknown): boolean;
+/**
  * Build the aiProxy invocation event. Text models use action "chat";
  * image models use action "image" and carry the image-model extras straight
  * through (the cloud function validates them before calling generateImage).
@@ -301,6 +307,7 @@ export declare const _internal: {
     MODEL_CATALOG: Readonly<Record<string, ModelSpec>>;
     IMAGE_MODEL_CATALOG: Readonly<Record<string, ImageModelSpec>>;
     isImageModel: typeof isImageModel;
+    hasImageParts: typeof hasImageParts;
     isValidEnvId: typeof isValidEnvId;
     isValidFunctionName: typeof isValidFunctionName;
     gatewayBase: typeof gatewayBase;

@@ -10,8 +10,10 @@
  * Event contract (sent by the plugin as the invocation body):
  *   { action?: "chat" | "image" | "ping",  // default "chat"
  *     model: string,                  // e.g. "hy3" or "hy-image-v3.5-preview"
- *     messages: [{ role, content }],  // chat: string/text parts; image: text
- *                                     // + image_url parts (Chat/Messages)
+ *     messages: [{ role, content }],  // chat: string, text parts, and (for
+ *                                     // vision-capable models) image_url
+ *                                     // parts; image: text + image_url parts
+ *                                     // (Chat/Messages)
  *     // --- chat only ---
  *     temperature?: number,           // 0..2
  *     topP?: number,                  // 0..1
@@ -40,10 +42,17 @@
  *
  * Reply on failure:
  *   { error: { code, message, requestId? } }
- *   Codes: INVALID_REQUEST, IMAGE_INPUT_NOT_SUPPORTED, IMAGE_REQUEST_INVALID,
+ *   Codes: INVALID_REQUEST, IMAGE_INPUT_NOT_SUPPORTED (image parts sent to a
+ *   text-only model, or unsupported part types), IMAGE_REQUEST_INVALID,
  *   MODEL_NOT_ALLOWED, AI_CHANNEL_NOT_ALLOWED, AI_MODEL_NOT_SUPPORTED,
  *   EXCEED_TOKEN_QUOTA_LIMIT, TCB_ENV_MISSING, UPSTREAM_ERROR — mapped to
  *   HTTP statuses by the plugin.
+ *
+ * Vision capability (chat channel): per the CloudBase model matrix
+ * (https://docs.cloudbase.net/ai/available-models), `hy4`, `hy4-flash`,
+ * `deepseek-v4.1-flash` and `deepseek-v4.1-flash-1017` accept `image_url`
+ * content parts; `hy3` is text-only and `hy4-preview` is not listed as a
+ * vision model. Override the set with AI_PROXY_VISION_MODELS (comma-separated).
  *
  * Deployment notes:
  * - Runtime: Node.js (Nodejs18.15 or newer). Dependencies are installed by
@@ -84,6 +93,19 @@ const DEFAULT_ALLOWED_MODELS = [
  * its own allowlist and code path. Override with AI_PROXY_ALLOWED_IMAGE_MODELS
  * (comma-separated). Docs: https://docs.cloudbase.net/ai/image-model/node-sdk */
 const DEFAULT_ALLOWED_IMAGE_MODELS = ["hy-image-v3.5-preview"];
+
+/** Text models that accept image input (multimodal understanding). Per the
+ * CloudBase capability matrix (https://docs.cloudbase.net/ai/available-models)
+ * `hy4`, `hy4-flash`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-1017`
+ * have 图片=✅. `hy3` is ❌ and `hy4-preview` is not listed — the growth-plan
+ * docs describe it as text-only. Override with AI_PROXY_VISION_MODELS
+ * (comma-separated) when the console for your environment differs. */
+const DEFAULT_VISION_MODELS = [
+  "hy4-flash",
+  "hy4",
+  "deepseek-v4.1-flash",
+  "deepseek-v4.1-flash-1017",
+];
 
 const MAX_MESSAGES = 128;
 const MAX_SINGLE_MESSAGE_CHARS = 200_000;
@@ -157,6 +179,19 @@ function allowedImageModels() {
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
   return parsed.length > 0 ? parsed : DEFAULT_ALLOWED_IMAGE_MODELS.slice();
+}
+
+/** Models whose chat messages may contain `image_url` content parts. */
+function visionModels() {
+  const raw = process.env.AI_PROXY_VISION_MODELS;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return DEFAULT_VISION_MODELS.slice();
+  }
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return parsed.length > 0 ? parsed : DEFAULT_VISION_MODELS.slice();
 }
 
 /* ------------------------------------------------------------------ *
@@ -354,34 +389,63 @@ function isPlainObject(value) {
 const ALLOWED_ROLES = new Set(["system", "user", "assistant", "tool"]);
 
 /**
- * Reduce OpenAI message content to a string. Text array parts are
- * concatenated; anything else (images, files) is rejected. `allowEmpty`
- * accepts null/undefined (assistant messages that only carry tool_calls).
- * Returns { content } or { error }.
+ * Normalize OpenAI message content for the chat channel.
+ *
+ * - A string stays a string; null/undefined is allowed for assistant messages
+ *   that only carry tool_calls.
+ * - A pure-text array is flattened to a string (legacy behaviour).
+ * - An array containing `image_url` parts is preserved as a content-block
+ *   array when `allowImages` is true (the model is vision-capable), otherwise
+ *   it is rejected with IMAGE_INPUT_NOT_SUPPORTED.
+ * - video_url / file / unknown parts are always rejected: no model in the
+ *   default allowlist accepts them.
+ *
+ * Returns { content, hasImages, chars } or { error }.
  */
-function normalizeContent(content, index, allowEmpty) {
-  if (typeof content === "string") return { content };
-  if ((content === null || content === undefined) && allowEmpty) return { content: "" };
+function normalizeContent(content, index, allowEmpty, allowImages = false, model = "") {
+  if (typeof content === "string") return { content, hasImages: false, chars: content.length };
+  if ((content === null || content === undefined) && allowEmpty) return { content: "", hasImages: false, chars: 0 };
   if (Array.isArray(content)) {
-    // OpenAI multimodal array: keep text parts, refuse images/files.
-    const textParts = [];
+    const parts = [];
+    let hasImages = false;
+    let chars = 0;
     for (let partIndex = 0; partIndex < content.length; partIndex += 1) {
       const part = content[partIndex];
       if (isPlainObject(part) && part.type === "text" && typeof part.text === "string") {
-        textParts.push(part.text);
+        parts.push({ type: "text", text: part.text });
+        chars += part.text.length;
+        continue;
+      }
+      if (
+        isPlainObject(part) && part.type === "image_url" &&
+        isPlainObject(part.image_url) && typeof part.image_url.url === "string" &&
+        part.image_url.url.length > 0
+      ) {
+        if (!allowImages) {
+          return errorEnvelope(
+              "IMAGE_INPUT_NOT_SUPPORTED",
+              `messages[${index}].content[${partIndex}] is an image_url part, but model "${model}" does not accept image input. Use a vision-capable model (${visionModels().join(", ")}) or remove the image. Override with AI_PROXY_VISION_MODELS if your environment supports it.`,
+            );
+        }
+        parts.push({ type: "image_url", image_url: { url: part.image_url.url } });
+        hasImages = true;
+        chars += part.image_url.url.length;
         continue;
       }
       const partType = isPlainObject(part) && typeof part.type === "string" ? part.type : "unknown";
       return errorEnvelope(
           "IMAGE_INPUT_NOT_SUPPORTED",
-          `messages[${index}].content[${partIndex}] has type "${partType.slice(0, 24)}". This proxy supports text only (the Node SDK channel used here documents string content; image input is not forwarded).`,
+          `messages[${index}].content[${partIndex}] has type "${partType.slice(0, 24)}". This proxy forwards only text and (for vision models) image_url parts.`,
         );
     }
-    return { content: textParts.join("\n") };
+    if (!hasImages) {
+      return { content: parts.map((part) => part.text).join("\n"), hasImages: false, chars };
+    }
+    return { content: parts, hasImages: true, chars };
   }
   return errorEnvelope(
       "INVALID_REQUEST",
-      `messages[${index}].content must be a string or an array of text parts.`,
+      `messages[${index}].content must be a string or an array of text/image_url parts.`,
     );
 }
 
@@ -421,11 +485,12 @@ function normalizeToolCalls(toolCalls, index) {
 
 /**
  * Normalize one OpenAI-style message to the generateText input shape:
- * { role, content: string } plus `tool_calls` on assistant messages and
- * `tool_call_id` on tool messages. Images and unknown roles are rejected
- * with a diagnostic error code. Returns { message, chars } or { error }.
+ * { role, content: string | ContentBlock[] } plus `tool_calls` on assistant
+ * messages and `tool_call_id` on tool messages. Image parts are forwarded
+ * only for vision-capable models. Returns { message, chars, hasImages } or
+ * { error }.
  */
-function normalizeMessage(message, index) {
+function normalizeMessage(message, index, allowImages = false, model = "") {
   if (!isPlainObject(message)) {
     return errorEnvelope("INVALID_REQUEST", `messages[${index}] must be an object.`);
   }
@@ -437,11 +502,11 @@ function normalizeMessage(message, index) {
       );
   }
   const hasToolCalls = role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
-  const normalizedContent = normalizeContent(message.content, index, hasToolCalls);
+  const normalizedContent = normalizeContent(message.content, index, hasToolCalls, allowImages, model);
   if (normalizedContent.error) return { error: normalizedContent.error };
   const content = normalizedContent.content;
   const normalized = { role, content };
-  let chars = content.length;
+  let chars = normalizedContent.chars;
 
   if (hasToolCalls) {
     const calls = normalizeToolCalls(message.tool_calls, index);
@@ -455,13 +520,16 @@ function normalizeMessage(message, index) {
     }
     normalized.tool_call_id = message.tool_call_id;
   }
-  if (chars > MAX_SINGLE_MESSAGE_CHARS) {
+  // Vision messages carry base64 data URLs that are far larger than plain
+  // text; reuse the image-channel ceilings for those requests.
+  const singleLimit = allowImages ? MAX_IMAGE_SINGLE_MESSAGE_CHARS : MAX_SINGLE_MESSAGE_CHARS;
+  if (chars > singleLimit) {
     return errorEnvelope(
         "INVALID_REQUEST",
-        `messages[${index}] is too large (${chars} chars; limit ${MAX_SINGLE_MESSAGE_CHARS}).`,
+        `messages[${index}] is too large (${chars} chars; limit ${singleLimit}).`,
       );
   }
-  return { message: normalized, chars };
+  return { message: normalized, chars, hasImages: normalizedContent.hasImages };
 }
 
 /**
@@ -528,17 +596,21 @@ function validateChatEvent(event) {
     return errorEnvelope("INVALID_REQUEST", `Too many messages (${event.messages.length}; limit ${MAX_MESSAGES}).`);
   }
 
+  // Only models declared vision-capable may receive image_url parts; the
+  // rest keep the text-only contract and get a diagnostic error instead.
+  const allowImages = visionModels().includes(model);
+  const totalLimit = allowImages ? MAX_IMAGE_TOTAL_MESSAGE_CHARS : MAX_TOTAL_MESSAGE_CHARS;
   const messages = [];
   let totalChars = 0;
   for (let index = 0; index < event.messages.length; index += 1) {
-    const result = normalizeMessage(event.messages[index], index);
+    const result = normalizeMessage(event.messages[index], index, allowImages, model);
     if (result.error) return { error: result.error };
     const normalized = result.message;
     totalChars += result.chars;
-    if (totalChars > MAX_TOTAL_MESSAGE_CHARS) {
+    if (totalChars > totalLimit) {
       return errorEnvelope(
           "INVALID_REQUEST",
-          `Conversation too large (${totalChars} chars; limit ${MAX_TOTAL_MESSAGE_CHARS}). Trim the history.`,
+          `Conversation too large (${totalChars} chars; limit ${totalLimit}). Trim the history or use a public image URL instead of base64.`,
         );
     }
     messages.push(normalized);
@@ -899,6 +971,7 @@ exports._internal = {
   AI_MODEL_GROUP,
   DEFAULT_ALLOWED_MODELS,
   DEFAULT_ALLOWED_IMAGE_MODELS,
+  DEFAULT_VISION_MODELS,
   MAX_MESSAGES,
   MAX_SINGLE_MESSAGE_CHARS,
   MAX_TOTAL_MESSAGE_CHARS,
@@ -907,7 +980,9 @@ exports._internal = {
   MAX_IMAGE_TOTAL_MESSAGE_CHARS,
   allowedModels,
   allowedImageModels,
+  visionModels,
   validateChatEvent,
+  normalizeContent,
   normalizeMessage,
   normalizeTools,
   normalizeToolChoice,

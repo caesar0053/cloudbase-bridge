@@ -57,10 +57,15 @@ The function never runs a tool itself: it asks the model for one step and
 returns the model's `tool_calls` (with `finish_reason: "tool_calls"`) to
 the caller.
 
-**Chat** image parts are rejected with `IMAGE_INPUT_NOT_SUPPORTED` because
-the `generateText` input carries plain string content. To generate an image,
-use `action: "image"` instead (below) — that channel accepts `image_url`
-reference images.
+**Chat** image parts are forwarded only for vision-capable models. Per the
+[CloudBase model matrix](https://docs.cloudbase.net/ai/available-models),
+`hy4`, `hy4-flash`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-1017`
+accept `image_url` content blocks (public URL or base64 data URL) — this is
+multimodal understanding, i.e. image in, text out. `hy3` is explicitly
+text-only (图片 ❌) and `hy4-preview` is not listed as a vision model, so
+image parts sent to those are rejected with `IMAGE_INPUT_NOT_SUPPORTED`.
+`video_url` / `file` content parts are never forwarded. Override the vision
+set with the `AI_PROXY_VISION_MODELS` env var (comma-separated).
 
 ### Image event (`action: "image"`)
 
@@ -160,8 +165,10 @@ with codes such as `INVALID_REQUEST`, `IMAGE_INPUT_NOT_SUPPORTED`,
    `AI_PROXY_ALLOWED_MODELS` (comma-separated text model ids) — default
    `hy4-flash,hy4,hy4-preview,hy3,deepseek-v4.1-flash,deepseek-v4.1-flash-1017`
    — and `AI_PROXY_ALLOWED_IMAGE_MODELS` (default
-   `hy-image-v3.5-preview`). CloudBase itself rejects unsupported ids with
-   `AI_MODEL_NOT_SUPPORTED`.
+   `hy-image-v3.5-preview`), and `AI_PROXY_VISION_MODELS` (comma-separated
+   text model ids allowed to receive `image_url` parts — default
+   `hy4-flash,hy4,deepseek-v4.1-flash,deepseek-v4.1-flash-1017`). CloudBase
+   itself rejects unsupported ids with `AI_MODEL_NOT_SUPPORTED`.
 5. Deploy, then verify with the console's inline test: invoke with
    `{"action":"ping"}` — expect `{"ok":true,"service":"aiProxy","version":"1.2.0","models":[…],"imageModels":[…]}`. The
    `imageModels` field is what makes the plugin offer the image model.

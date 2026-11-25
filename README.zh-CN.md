@@ -26,15 +26,17 @@ Agent ─► magpie 网关 ─► 插件 ── POST /v1/functions/aiProxy ─�
 
 ## 模型
 
-| 模型 ID | 类型 | 上下文 / 输出 |
-| --- | --- | --- |
-| `hy4-flash` | 文本对话 | 1M |
-| `hy4` | 文本对话 | 1M |
-| `hy4-preview` | 文本对话 | 1M |
-| `hy3` | 文本对话 | 256K |
-| `deepseek-v4.1-flash` | 文本对话 | 1M |
-| `deepseek-v4.1-flash-1017` | 文本对话 | 1M |
-| `hy-image-v3.5-preview` | **生图** | 最高 4096×4096 |
+| 模型 ID | 类型 | 上下文 / 输出 | 图片输入 |
+| --- | --- | --- | --- |
+| `hy4-flash` | 文本对话 | 1M | ✅ |
+| `hy4` | 文本对话 | 1M | ✅ |
+| `hy4-preview` | 文本对话 | 1M | — |
+| `hy3` | 文本对话 | 256K | ❌ |
+| `deepseek-v4.1-flash` | 文本对话 | 1M | ✅ |
+| `deepseek-v4.1-flash-1017` | 文本对话 | 1M | ✅ |
+| `hy-image-v3.5-preview` | **生图** | 最高 4096×4096 | ✅ 参考图 |
+
+> 「图片输入」列依据[官方模型能力矩阵](https://docs.cloudbase.net/ai/available-models)：✅ 支持 `image_url` 内容块（图进→文出），❌ 官方明确纯文本，— 官方未声明（本插件按纯文本处理，可用 `AI_PROXY_VISION_MODELS` 覆盖）。
 
 这些模型不用在控制台开启，用量会自动从赠送额度里扣（文本走 Token、生图走赠送的 10 万张生图额度）。个别模型在部分环境不一定放开——如果 CloudBase 返回 `AI_MODEL_NOT_SUPPORTED`，以你环境的实际支持为准。
 
@@ -122,7 +124,8 @@ m plugin options cloudbase-bridge '{"gatewayBaseUrl":"http://127.0.0.1:8787"}'
 - 没有真流式：上游是一次性返回，SSE 在本地合成，所以首 token 要等整段生成完；生图同理，要等整张图生成完才返回；
 - 工具调用需要 aiProxy 1.1.0 及以上——插件从 0.2.4 或更早版本升级后，要重新部署一次云函数（`tcb fn deploy aiProxy --force`）；
 - 生图需要 aiProxy 1.2.0+ 与 `@cloudbase/node-sdk ^3.18.3`、云函数超时 900 秒；
-- **文本对话**不支持图片输入（会报 `IMAGE_INPUT_NOT_SUPPORTED`）；**生图模型**支持参考图，但要用 `image_url` 内容块；
+- **图片输入（视觉理解）**：`hy4`、`hy4-flash`、`deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017` 支持 `image_url` 内容块（图进→文出，支持公网 URL 与 Base64）；`hy3`、`hy4-preview` 是纯文本，传图会报 `IMAGE_INPUT_NOT_SUPPORTED`。可用云函数环境变量 `AI_PROXY_VISION_MODELS` 覆盖这份名单；视频/文件内容块不转发；
+- **生图模型**同样支持参考图，也要用 `image_url` 内容块；
 - 生图返回的图片 URL **12 小时后失效**，需及时转存；多轮编辑的 `assembled_history` 目前只在非流式响应的 `image` 结构化字段里提供；
 - 特别长的输出可能撞上云函数超时；生图（尤其 4K）耗时较长，请耐心等待；
 - 没有额度展示（官方没给查询 API）；赠送额度本身有期限（6 个月）。

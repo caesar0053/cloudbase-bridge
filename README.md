@@ -22,15 +22,21 @@ The function returns one complete result; the plugin reshapes it into OpenAI Cha
 
 ## Models
 
-| Model ID | Type | Context / output |
-| --- | --- | --- |
-| `hy4-flash` | text chat | 1M |
-| `hy4` | text chat | 1M |
-| `hy4-preview` | text chat | 1M |
-| `hy3` | text chat | 256K |
-| `deepseek-v4.1-flash` | text chat | 1M |
-| `deepseek-v4.1-flash-1017` | text chat | 1M |
-| `hy-image-v3.5-preview` | **image generation** | up to 4096x4096 |
+| Model ID | Type | Context / output | Image input |
+| --- | --- | --- | --- |
+| `hy4-flash` | text chat | 1M | ✅ |
+| `hy4` | text chat | 1M | ✅ |
+| `hy4-preview` | text chat | 1M | — |
+| `hy3` | text chat | 256K | ❌ |
+| `deepseek-v4.1-flash` | text chat | 1M | ✅ |
+| `deepseek-v4.1-flash-1017` | text chat | 1M | ✅ |
+| `hy-image-v3.5-preview` | **image generation** | up to 4096x4096 | ✅ reference |
+
+> The *Image input* column follows the
+> [CloudBase model matrix](https://docs.cloudbase.net/ai/available-models):
+> ✅ accepts `image_url` content parts (image in, text out), ❌ officially
+> text-only, — not declared (this bridge treats it as text-only; override
+> with `AI_PROXY_VISION_MODELS`).
 
 No console opt-in needed; usage is deducted from the gift pack automatically
 (tokens for text, the 100K image generations for images). Availability can
@@ -137,7 +143,7 @@ Errors come back as OpenAI-style `{ error: { message, code } }`, and the message
 - No true streaming: the upstream reply is one-shot, SSE is synthesized locally, so the first token only arrives when generation finishes — the same applies to images (the whole image must be generated first);
 - tool calling needs aiProxy 1.1.0 or later — redeploy the function (`tcb fn deploy aiProxy --force`) after upgrading the plugin from 0.2.4 or earlier;
 - image generation needs aiProxy 1.2.0+, `@cloudbase/node-sdk ^3.18.3` and a 900 s function timeout;
-- **text chat** has no image input (`IMAGE_INPUT_NOT_SUPPORTED`); the **image model** accepts reference images via `image_url` content parts;
+- **vision chat**: `hy4`, `hy4-flash`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-1017` accept `image_url` content parts (multimodal understanding — image in, text out); `hy3` and `hy4-preview` are text-only and return `IMAGE_INPUT_NOT_SUPPORTED`. Override that set with the function's `AI_PROXY_VISION_MODELS` env var. Video/file content parts are not forwarded;
 - generated image URLs expire after **12 hours** — transfer them to cloud storage. Multi-turn `assembled_history` is currently exposed only in the non-streaming `image` structured field;
 - very long outputs / 4K images can be slow; be patient;
 - no quota reporting (no official API for it); the gift quota itself expires (6 months).

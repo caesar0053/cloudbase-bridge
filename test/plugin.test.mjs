@@ -829,6 +829,47 @@ test("image requests use a larger payload ceiling than text chat", async () => {
   }
 });
 
+test("vision chat requests use the larger payload ceiling too", async () => {
+  const { hooks } = await makePlugin();
+  const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
+  try {
+    const doFetch = await loaderFetch(hooks);
+    // A ~600 KB base64 image in a *chat* request: over the 512 KiB text
+    // limit, but vision-capable models must still get it through.
+    const bigRef = "data:image/png;base64," + "A".repeat(600_000);
+    const res = await doFetch(
+      chatBody({
+        model: "deepseek-v4.1-flash",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe this" },
+              { type: "image_url", image_url: { url: bigRef } },
+            ],
+          },
+        ],
+      }),
+    );
+    assert.equal(res.status, 200, "vision chat with a base64 image must not hit the text payload limit");
+    const sentEvent = JSON.parse(gw.calls[0].init.body);
+    assert.equal(sentEvent.action, "chat");
+    assert.ok(sentEvent.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"));
+  } finally {
+    gw.restore();
+  }
+});
+
+test("hasImageParts detects image_url content blocks", () => {
+  assert.equal(_internal.hasImageParts([{ role: "user", content: "plain text" }]), false);
+  assert.equal(_internal.hasImageParts([{ role: "user", content: [{ type: "text", text: "hi" }] }]), false);
+  assert.equal(
+    _internal.hasImageParts([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x/a.png" } }] }]),
+    true,
+  );
+  assert.equal(_internal.hasImageParts(undefined), false);
+});
+
 test("provider.models merges imageModels from aiProxy ping", async () => {
   const { hooks } = await makePlugin();
   const base = {
