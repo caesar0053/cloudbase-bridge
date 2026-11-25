@@ -26,8 +26,9 @@
  *              reshapes choices[0].delta.image into a Chat Completions
  *              message (a markdown image + a structured `image` field), so
  *              the same OpenAI-compatible surface works for both.
- * Image requests allow a much longer timeout (900 s) and a larger payload
- * (base64 reference images), per the official image-model docs.
+ * Image requests allow a much longer timeout (900 s), per the official
+ * image-model docs. Both channels share the documented 6 MB cloud-function
+ * request-body ceiling (base64 images count toward it).
  *
  * Magpie plugin contract (verified against https://usemagpie.ai/docs/zh/plugins
  * on 2026-11-09):

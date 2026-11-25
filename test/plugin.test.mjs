@@ -444,11 +444,18 @@ test("unknown model ids are rejected locally with 404 (no cloud call)", async ()
   }
 });
 
+test("payload limits follow the documented 6 MB cloud-function body ceiling", () => {
+  // EXCEED_MAX_PAYLOAD_SIZE: cloud-function request bodies are capped at
+  // 6 MB for non-text (application/json) types. Both channels must use it.
+  assert.equal(_internal.DEFAULT_MAX_EVENT_BYTES, 6 * 1024 * 1024);
+  assert.equal(_internal.IMAGE_MAX_EVENT_BYTES, 6 * 1024 * 1024);
+});
+
 test("oversized conversations are rejected with 413", async () => {
   const { hooks } = await makePlugin();
   const doFetch = await loaderFetch(hooks);
   const res = await doFetch(
-    chatBody({ messages: [{ role: "user", content: "x".repeat(_internal.DEFAULT_MAX_EVENT_BYTES) }] }),
+    chatBody({ messages: [{ role: "user", content: "x".repeat(_internal.DEFAULT_MAX_EVENT_BYTES + 1) }] }),
   );
   assert.equal(res.status, 413);
 });
@@ -463,10 +470,10 @@ test("payload limit counts UTF-8 bytes, not JavaScript string length (CJK conten
     const okRes = await doFetch(chatBody({ messages: [{ role: "user", content: "你好，世界" }] }));
     assert.equal(okRes.status, 200);
 
-    // 200_000 CJK chars: only 200_000 UTF-16 code units (below the 512 KiB
-    // limit, so a naive .length check would forward it), but ~600_000 UTF-8
-    // bytes (over the limit).
-    const cjk = "好".repeat(200_000);
+    // ~2.1M CJK chars: only ~2.1M UTF-16 code units (below the 6 MiB limit,
+    // so a naive .length check would forward it), but ~6.3M UTF-8 bytes
+    // (over the limit). 3 bytes per char for the CJK ideographs used here.
+    const cjk = "好".repeat(Math.ceil(_internal.DEFAULT_MAX_EVENT_BYTES / 3) + 100);
     assert.ok(cjk.length < _internal.DEFAULT_MAX_EVENT_BYTES, "precondition: string length is under the limit");
     assert.ok(
       new TextEncoder().encode(cjk).byteLength > _internal.DEFAULT_MAX_EVENT_BYTES,
@@ -480,7 +487,8 @@ test("payload limit counts UTF-8 bytes, not JavaScript string length (CJK conten
     const match = payload.error.message.match(/too large \((\d+) bytes; limit (\d+) bytes\)/);
     assert.ok(match, `error message must report byte counts with byte units: ${payload.error.message}`);
     assert.ok(Number(match[1]) > Number(match[2]), "reported size must exceed the limit");
-    assert.ok(Number(match[1]) > 600_000, "reported size must be the UTF-8 byte count, not the char count");
+    assert.ok(Number(match[1]) > cjk.length, "reported size must be the UTF-8 byte count, not the char count");
+    assert.match(payload.error.message, /6 MB/, "413 must cite the documented platform ceiling");
   } finally {
     gw.restore();
   }
@@ -799,18 +807,18 @@ test("bridge image errors: error envelope and shapeless reply", async () => {
   }
 });
 
-test("image requests use a larger payload ceiling than text chat", async () => {
+test("image and chat channels share the 6 MB body ceiling", async () => {
   const { hooks } = await makePlugin();
   const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyImageResult()), { status: 200 }));
   try {
     const doFetch = await loaderFetch(hooks);
-    // A ~600 KB base64 reference image: over the 512 KiB text limit, but
-    // well within the image ceiling.
+    // A ~600 KB base64 reference image is now well within the shared 6 MB
+    // ceiling for both channels.
     const bigRef = "data:image/png;base64," + "A".repeat(600_000);
     const res = await doFetch(
       imageBody({ messages: [{ role: "user", content: [{ type: "text", text: "参考图" }, { type: "image_url", image_url: { url: bigRef } }] }] }),
     );
-    assert.equal(res.status, 200, "large reference image must not hit the text payload limit");
+    assert.equal(res.status, 200, "a 600 KB reference image must pass under the 6 MB ceiling");
     const sentEvent = JSON.parse(gw.calls[0].init.body);
     assert.equal(sentEvent.action, "image");
     assert.ok(sentEvent.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"));
@@ -818,24 +826,37 @@ test("image requests use a larger payload ceiling than text chat", async () => {
     gw.restore();
   }
 
-  // The same payload on a text model is still rejected with 413.
+  // A 600 KB plain-text chat also passes now — the old 512 KiB cap was the
+  // platform-inconsistent restriction that caused real-world 413s.
   const gw2 = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
   try {
     const doFetch = await loaderFetch(hooks);
     const res = await doFetch(chatBody({ messages: [{ role: "user", content: "x".repeat(600_000) }] }));
-    assert.equal(res.status, 413);
+    assert.equal(res.status, 200, "a 600 KB text conversation is legal under the 6 MB ceiling");
   } finally {
     gw2.restore();
   }
 });
 
-test("vision chat requests use the larger payload ceiling too", async () => {
+test("image requests above 6 MB are rejected with a platform-ceiling hint", async () => {
+  const { hooks } = await makePlugin();
+  const doFetch = await loaderFetch(hooks);
+  // ~6.3 MB base64 reference image exceeds the 6 MB platform body limit.
+  const bigRef = "data:image/png;base64," + "A".repeat(6 * 1024 * 1024);
+  const res = await doFetch(
+    imageBody({ messages: [{ role: "user", content: [{ type: "text", text: "参考图" }, { type: "image_url", image_url: { url: bigRef } }] }] }),
+  );
+  assert.equal(res.status, 413);
+  const payload = await res.json();
+  assert.match(payload.error.message, /6 MB/);
+  assert.match(payload.error.message, /public image URL/);
+});
+
+test("vision chat requests accept inline images within the shared ceiling", async () => {
   const { hooks } = await makePlugin();
   const gw = mockGateway(async () => new Response(JSON.stringify(aiProxyCompletion()), { status: 200 }));
   try {
     const doFetch = await loaderFetch(hooks);
-    // A ~600 KB base64 image in a *chat* request: over the 512 KiB text
-    // limit, but vision-capable models must still get it through.
     const bigRef = "data:image/png;base64," + "A".repeat(600_000);
     const res = await doFetch(
       chatBody({
@@ -851,7 +872,7 @@ test("vision chat requests use the larger payload ceiling too", async () => {
         ],
       }),
     );
-    assert.equal(res.status, 200, "vision chat with a base64 image must not hit the text payload limit");
+    assert.equal(res.status, 200, "vision chat with a base64 image must pass under the 6 MB ceiling");
     const sentEvent = JSON.parse(gw.calls[0].init.body);
     assert.equal(sentEvent.action, "chat");
     assert.ok(sentEvent.messages[0].content[1].image_url.url.startsWith("data:image/png;base64,"));

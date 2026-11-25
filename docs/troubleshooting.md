@@ -161,7 +161,7 @@ local `tcb fn run` quirk) it's absent.
 | `MODEL_NOT_ALLOWED` / `AI_MODEL_NOT_SUPPORTED` (404) | Model not in the image allowlist or not enabled in your environment | Check `AI_PROXY_ALLOWED_IMAGE_MODELS`; confirm the growth-plan image quota is active in the console. Some environments may not have the model |
 | `IMAGE_REQUEST_INVALID` (400) | A bad `size`/`seed`/`footnote`/`session`, or an unsupported `content` part | `size` must be `WxH` with sides 256–8192 and area ≤ 4096×4096; only `text` and `image_url` parts are accepted |
 | `aiProxy image reply is missing ... delta.image.url` (502) | The function answered without a usable image — often an outdated SDK or an upstream error | Redeploy with node-sdk ≥ 3.18.3; check function logs |
-| `PAYLOAD_TOO_LARGE` (413) | A base64 reference image exceeded the 8 MiB event cap | Use a public image URL instead of a large inline Base64, or resize it |
+| `PAYLOAD_TOO_LARGE` (413) | The serialized request exceeded CloudBase's 6 MB cloud-function body limit (`EXCEED_MAX_PAYLOAD_SIZE`) — applies to both text chat and image requests | Trim the conversation history; for inline base64 images use a public URL or resize. Byte count is measured as real UTF-8 (CJK costs ~3 bytes/char) |
 | Content-safety error (400/422 upstream) | The prompt or reference image was blocked | Rephrase the prompt / change the reference image |
 | Generated image link is dead later | Image URLs expire after **12 hours** | Download it or transfer it to CloudBase cloud storage right away (see the [image docs](https://docs.cloudbase.net/ai/image-model/node-sdk)) |
 

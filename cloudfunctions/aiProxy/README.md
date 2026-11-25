@@ -211,8 +211,12 @@ tcb fn invoke aiProxy --params '{"action":"image","model":"hy-image-v3.5-preview
   normally pass the default rule; if you see `EXCEED_AUTHORITY`, review the
   function security rules in the console
   (see `docs/troubleshooting.md`).
-- Size limits — chat: ≤128 messages, ≤200 000 chars per message, ≤400 000
-  chars total; image: ≤64 messages, ≤2 000 000 chars per message (base64
-  reference images), ≤8 000 000 chars total. These keep agents from burning
-  quota with runaway histories. The plugin additionally caps the serialized
-  event at 512 KiB (chat) / 8 MiB (image).
+- Size limits — both channels: ≤10 000 messages and ≤6 291 456 chars per
+  message and in total. These are a second line of defence against runaway
+  histories. The authoritative cap is the plugin's 6 MB serialized-event
+  check, which measures real UTF-8 bytes and matches the documented
+  CloudBase cloud-function request-body limit (error `EXCEED_MAX_PAYLOAD_SIZE`:
+  JSON bodies 6 MB; text bodies only 100 KB). base64 is ASCII, so its chars
+  and bytes coincide. Do not raise the event ceiling above 6 MB — the
+  platform will cut the request off with 406 upstream.
+  https://docs.cloudbase.net/error-code/EXCEED_MAX_PAYLOAD_SIZE

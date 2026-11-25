@@ -107,12 +107,19 @@ const DEFAULT_VISION_MODELS = [
   "deepseek-v4.1-flash-1017",
 ];
 
-const MAX_MESSAGES = 128;
-const MAX_SINGLE_MESSAGE_CHARS = 200_000;
-const MAX_TOTAL_MESSAGE_CHARS = 400_000;
-const MAX_IMAGE_MESSAGES = 64;
-const MAX_IMAGE_SINGLE_MESSAGE_CHARS = 2_000_000; // base64 reference images can be large; single image <= 20 MB
-const MAX_IMAGE_TOTAL_MESSAGE_CHARS = 8_000_000;
+// CloudBase caps cloud-function request bodies at 6 MB (application/json;
+// error code EXCEED_MAX_PAYLOAD_SIZE). The plugin enforces that in UTF-8
+// bytes before invoking; these char limits are a second line of defence for
+// direct invocations and are set to the same ~6 M magnitude so they never
+// reject a request the plugin already accepted. base64 is ASCII, so chars
+// and bytes coincide there.
+// https://docs.cloudbase.net/error-code/EXCEED_MAX_PAYLOAD_SIZE
+const MAX_MESSAGES = 10_000;
+const MAX_SINGLE_MESSAGE_CHARS = 6_291_456;
+const MAX_TOTAL_MESSAGE_CHARS = 6_291_456;
+const MAX_IMAGE_MESSAGES = 10_000;
+const MAX_IMAGE_SINGLE_MESSAGE_CHARS = 6_291_456;
+const MAX_IMAGE_TOTAL_MESSAGE_CHARS = 6_291_456;
 const MAX_MODEL_ID_LENGTH = 64;
 const MAX_TOOLS = 128;
 const MAX_TOOL_CALLS_PER_MESSAGE = 64;

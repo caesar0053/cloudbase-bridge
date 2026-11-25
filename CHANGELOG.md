@@ -17,8 +17,8 @@ All notable changes to this project are documented here. The format follows
 - Image requests support the documented options: `size` (incl. 4K), `seed`,
   `generate_max_pixels`, `resize_max_pixels`, `session`, `footnote`,
   `use_search_tool`, plus `image_url` reference images and multi-turn
-  `assembled_history` replay. They get a **900 s** timeout and an **8 MiB**
-  event ceiling (vs 150 s / 512 KiB for text chat).
+  `assembled_history` replay. They get a **900 s** timeout (vs 150 s for text
+  chat); all channels share the documented **6 MB** request-body ceiling.
 - **aiProxy 1.2.0**: new `action: "image"` branch with its own allowlist
   (`AI_PROXY_ALLOWED_IMAGE_MODELS`), strict validation and error code
   `IMAGE_REQUEST_INVALID`; `ping` now reports `imageModels`. Requires
@@ -34,13 +34,20 @@ All notable changes to this project are documented here. The format follows
   `deepseek-v4.1-flash-1017` are vision-capable (图片 ✅); `hy3` is ❌ and
   `hy4-preview` is not listed as a vision model. `IMAGE_INPUT_NOT_SUPPORTED`
   now means "this model / this content type", not "the chat channel".
-  Override the set with `AI_PROXY_VISION_MODELS`; vision chat requests get
-  the 8 MiB event ceiling so base64 images are not rejected by the 512 KiB
-  text limit. Video/file parts are still not forwarded.
+  Override the set with `AI_PROXY_VISION_MODELS`. Video/file parts are still
+  not forwarded.
+- Payload limits now follow the official CloudBase error-code doc
+  (`EXCEED_MAX_PAYLOAD_SIZE`): a cloud-function `application/json` body is
+  capped at **6 MB**. The old 512 KiB text cap rejected ordinary long
+  conversations (e.g. a 537 KB request) and the old 8 MiB image cap sat above
+  the platform hard limit; both channels now use 6 MB, and aiProxy's char
+  limits were raised to match (≤10 000 messages, ≤6 291 456 chars). The 413
+  message cites the platform ceiling; inline base64 images get a hint to use
+  a public URL instead.
 - Tests: 20 new unit/load-check cases for image validation, routing,
-  reshaping, allowlists, payload ceiling and error mapping, plus 6 for
-  vision chat gating and payload ceilings (67 total); the mock gateway and
-  `check-plugin.mjs` now exercise the image channel.
+  reshaping, allowlists, payload ceiling and error mapping, plus more for
+  vision chat gating and the 6 MB body ceiling (69 total); the mock gateway
+  and `check-plugin.mjs` now exercise the image channel.
 
 ## [0.2.5] - 2026-11-24
 

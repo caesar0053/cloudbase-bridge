@@ -26,8 +26,9 @@
  *              reshapes choices[0].delta.image into a Chat Completions
  *              message (a markdown image + a structured `image` field), so
  *              the same OpenAI-compatible surface works for both.
- * Image requests allow a much longer timeout (900 s) and a larger payload
- * (base64 reference images), per the official image-model docs.
+ * Image requests allow a much longer timeout (900 s), per the official
+ * image-model docs. Both channels share the documented 6 MB cloud-function
+ * request-body ceiling (base64 images count toward it).
  *
  * Magpie plugin contract (verified against https://usemagpie.ai/docs/zh/plugins
  * on 2026-11-09):
@@ -56,10 +57,16 @@ const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; ke
 // Image generation (especially 4K) is slow; the official docs recommend a
 // 900 s cloud-function timeout. Give image requests that much headroom.
 const IMAGE_TIMEOUT_MS = 900_000;
-const DEFAULT_MAX_EVENT_BYTES = 512 * 1024;
-// Base64 reference images can be large (single image <= 20 MB in the image
-// API). Keep a generous but bounded ceiling for image events.
-const IMAGE_MAX_EVENT_BYTES = 8 * 1024 * 1024;
+// CloudBase's documented cloud-function request-body limit (error code
+// EXCEED_MAX_PAYLOAD_SIZE): text-type bodies 100 KB, other types 6 MB.
+// Function invocation sends `application/json`, i.e. the 6 MB bucket. Use
+// that platform ceiling for BOTH channels; the old 512 KiB text cap rejected
+// ordinary long conversations, and the old 8 MiB image cap was above the
+// platform hard limit and could be cut off with 406 upstream.
+// https://docs.cloudbase.net/error-code/EXCEED_MAX_PAYLOAD_SIZE
+const MAX_EVENT_BYTES = 6 * 1024 * 1024; // 6,291,456 bytes
+const DEFAULT_MAX_EVENT_BYTES = MAX_EVENT_BYTES;
+const IMAGE_MAX_EVENT_BYTES = MAX_EVENT_BYTES;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
 const GATEWAY_SUFFIX_CN = ".api.tcloudbasegateway.com";
@@ -624,14 +631,16 @@ async function bridgeFetch(input, init) {
     const payload = JSON.stringify(event);
     // Measure real UTF-8 bytes: string .length counts UTF-16 code units and
     // under-reports CJK content (each CJK char is typically 3 bytes but 1-2 units).
-    // Image-generation events AND vision chat events (image_url content parts)
-    // get a larger ceiling because base64 reference images are big.
+    // Both channels share the documented 6 MB cloud-function body ceiling.
     const payloadBytes = new TextEncoder().encode(payload).byteLength;
-    const largePayload = imageRequest || hasImageParts(body.messages);
-    const maxEventBytes = largePayload ? IMAGE_MAX_EVENT_BYTES : DEFAULT_MAX_EVENT_BYTES;
+    const maxEventBytes = imageRequest ? IMAGE_MAX_EVENT_BYTES : DEFAULT_MAX_EVENT_BYTES;
     if (payloadBytes > maxEventBytes) {
-        const hint = largePayload ? "Use a public image URL instead of a large base64 reference." : "Trim the history and retry.";
-        return errorResponse(413, `Conversation payload too large (${payloadBytes} bytes; limit ${maxEventBytes} bytes). ${hint}`, { code: "PAYLOAD_TOO_LARGE" });
+        // Keep a targeted hint for inline base64 images even though the ceiling
+        // is now shared — a public URL is still the cheaper fix.
+        const hint = hasImageParts(body.messages)
+            ? "Use a public image URL instead of a large base64 reference, or trim the history."
+            : "Trim the history and retry.";
+        return errorResponse(413, `Conversation payload too large (${payloadBytes} bytes; limit ${maxEventBytes} bytes). CloudBase caps cloud-function request bodies at 6 MB. ${hint}`, { code: "PAYLOAD_TOO_LARGE" });
     }
     log("debug", `invoke ${cfg.functionName} action=${imageRequest ? "image" : "chat"} model=${model} stream=${stream} bytes=${payloadBytes}`);
     // Image generation is far slower than text chat; give it the documented
